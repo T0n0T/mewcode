@@ -1,0 +1,16 @@
+# Copy this file to ~/.mewcode/config.yaml and replace api_key.
+
+name: openai-main
+protocol: openai
+model: gpt-5-mini
+base_url: https://api.openai.com/v1
+api_key: your-openai-api-key
+thinking: false
+
+# Anthropic alternative:
+# name: claude-main
+# protocol: anthropic
+# model: claude-sonnet-4-5
+# base_url: https://api.anthropic.com/v1
+# api_key: your-anthropic-api-key
+# thinking: true

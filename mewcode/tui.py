@@ -9,6 +9,10 @@ from mewcode.runtime import ChatRuntime
 
 EXIT_COMMANDS = {"exit", "quit"}
 
+CAT_BANNER = r""" /\_/\
+( o.o )
+ > ^ <"""
+
 
 class ChatApp:
     def __init__(
@@ -24,11 +28,10 @@ class ChatApp:
         self.output_stream = output_stream or sys.stdout
 
     def run(self) -> int:
-        self._write(f"MewCode\nUsing config: {self.config.name} ({self.config.protocol})\n")
-        self._write("Type 'exit' or 'quit' to end the session.\n")
+        self._write_header()
 
         while True:
-            self._write("\nYou> ")
+            self._write("\n╭─ you\n╰─ ")
             line = self.input_stream.readline()
             if line == "":
                 self._write("\n")
@@ -41,7 +44,7 @@ class ChatApp:
                 self._write("Bye.\n")
                 return 0
 
-            self._write("AI> ")
+            self._write("╰─ assistant\n   ")
             try:
                 for chunk in self.runtime.stream_turn(user_text):
                     self._write(chunk)
@@ -52,3 +55,15 @@ class ChatApp:
     def _write(self, text: str) -> None:
         self.output_stream.write(text)
         self.output_stream.flush()
+
+    def _write_header(self) -> None:
+        self._write(
+            f"{CAT_BANNER}\n"
+            "\n"
+            "MewCode\n"
+            f"  config   {self.config.name}\n"
+            f"  provider {self.config.protocol}\n"
+            f"  model    {self.config.model}\n"
+            "\n"
+            "Type 'exit' or 'quit' to end the session.\n"
+        )

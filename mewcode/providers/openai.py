@@ -18,6 +18,7 @@ class OpenAIProvider:
         self._http_client = http_client
 
     def stream_chat(self, messages: Sequence[ChatMessage]) -> Iterator[str]:
+        url = f"{self.config.base_url}/responses"
         body = {
             "model": self.config.model,
             "input": [{"role": message.role, "content": message.content} for message in messages],
@@ -30,7 +31,7 @@ class OpenAIProvider:
         }
 
         try:
-            with self._stream("POST", f"{self.config.base_url}/responses", headers=headers, json=body) as response:
+            with self._stream("POST", url, headers=headers, json=body) as response:
                 self._raise_for_status(response)
                 for event in iter_sse_events(response):
                     yield from self._text_chunks_from_event(event.data, event.event)
@@ -38,7 +39,9 @@ class OpenAIProvider:
             raise ProviderError(redact_secrets(exc.user_message, [self.config.api_key])) from exc
         except httpx.HTTPError as exc:
             message = redact_secrets(str(exc), [self.config.api_key])
-            raise ProviderError(f"OpenAI request failed: {message}") from exc
+            raise ProviderError(
+                f"OpenAI request failed for {url}: {message}. Check that base_url is correct and the provider service is running."
+            ) from exc
 
     def _stream(self, method: str, url: str, **kwargs: Any) -> AbstractContextManager[Any]:
         if self._http_client is not None:

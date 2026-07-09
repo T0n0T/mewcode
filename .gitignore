@@ -8,5 +8,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+.codebase-memory/
 
 .mewcode/config.yaml

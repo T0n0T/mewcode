@@ -7,7 +7,7 @@
 | 新建 | `mewcode/__init__.py` | 包初始化与版本信息 |
 | 新建 | `mewcode/__main__.py` | 支持 `python -m mewcode` |
 | 新建 | `mewcode/cli.py` | CLI 启动编排 |
-| 新建 | `mewcode/config.py` | YAML 配置加载、字段校验、`LLMConfig` |
+| 新建 | `mewcode/config.py` | YAML 配置查找、加载、字段校验、`LLMConfig` |
 | 新建 | `mewcode/errors.py` | 可展示错误类型 |
 | 新建 | `mewcode/runtime.py` | 多轮会话历史与单轮流式运行 |
 | 新建 | `mewcode/tui.py` | 行式交互界面与流式打印 |
@@ -23,7 +23,9 @@
 | 新建 | `tests/test_tui.py` | TUI 输入输出测试 |
 | 修改 | `main.py` | 兼容旧入口，转调新 CLI |
 | 修改 | `pyproject.toml` | 增加依赖、命令入口、pytest 配置 |
-| 修改 | `README.md` | 增加最小使用说明和配置样例 |
+| 修改 | `README.md` | 增加最小使用说明、配置查找顺序和配置样例 |
+| 新建 | `config.yaml.example` | 可复制的示例配置文件 |
+| 新建 | `AGENTS.md` | 简短项目协作说明 |
 
 ## T1: 初始化项目依赖和命令入口配置
 
@@ -80,14 +82,15 @@
 **文件：** `mewcode/config.py`  
 **依赖：** T3、T4  
 **步骤：**
-1. 定义 `CONFIG_PATH = Path.home() / ".mewcode" / "config.yaml"`。
+1. 定义项目级配置路径 `./.mewcode/config.yaml` 和用户级配置路径 `~/.mewcode/config.yaml`。
 2. 定义 `LLMConfig` 数据结构，包含 `name`、`protocol`、`model`、`base_url`、`api_key`、`thinking`。
-3. 实现 YAML 文件读取，缺失文件时报 `ConfigError` 并提示路径。
-4. 校验必需字段 `name`、`protocol`、`model`、`base_url`、`api_key`。
-5. 将可选字段 `thinking` 缺省归一化为 `False`，并校验必须为布尔值。
-6. 校验 `protocol` 只能是 `openai` 或 `anthropic`。
-7. 规范化 `base_url`，去掉末尾 `/`。
-8. 确保错误消息不包含 `api_key` 原文。
+3. 实现默认配置查找：优先读取项目级配置，缺失时回退用户级配置。
+4. 显式传入路径时只读取该路径，便于测试和未来 CLI 参数扩展。
+5. 校验必需字段 `name`、`protocol`、`model`、`base_url`、`api_key`。
+6. 将可选字段 `thinking` 缺省归一化为 `False`，并校验必须为布尔值。
+7. 校验 `protocol` 只能是 `openai` 或 `anthropic`。
+8. 规范化 `base_url`，去掉末尾 `/`。
+9. 确保错误消息不包含 `api_key` 原文。
 
 **验证：** 运行 `uv run pytest tests/test_config.py`，期望配置读取、字段缺失、未知协议、thinking 缺省和密钥脱敏测试通过。
 
@@ -131,7 +134,7 @@
 5. 请求体包含 `model`、`input`、`stream: true`。
 6. 使用 `iter_sse_events` 解析流式响应。
 7. 只对 OpenAI 最终文本增量事件产出文本片段。
-8. 遇到错误事件、HTTP 非 2xx、网络异常或解析异常时抛出 `ProviderError`。
+8. 遇到错误事件、HTTP 非 2xx、网络异常或解析异常时抛出 `ProviderError`；连接失败类错误应包含目标 URL 和检查 `base_url`/Provider 服务是否运行的提示。
 9. 确保错误信息不包含 `api_key`。
 
 **验证：** 运行 `uv run pytest tests/test_providers.py -k openai`，期望请求 URL、请求头、请求体、文本 delta 过滤和错误脱敏测试通过。
@@ -176,16 +179,17 @@
 **依赖：** T10  
 **步骤：**
 1. 定义 `ChatApp`，接收 `ChatRuntime`、`LLMConfig`、输入流和输出流。
-2. 启动时打印 MewCode 欢迎信息、当前配置名和协议名。
+2. 启动时打印猫猫文字画、MewCode 标题、当前配置名、协议名和模型名。
 3. 循环显示用户输入提示。
 4. 忽略空输入。
 5. 识别 `exit`、`quit` 退出命令。
 6. 捕获 Ctrl-D 并正常退出。
 7. 对每轮输入调用 `runtime.stream_turn(user_text)`。
-8. 对每个回复片段立即写入输出流并 flush。
-9. 每轮回复结束后打印换行。
-10. 捕获 `MewCodeError`，打印可展示错误并继续输入循环。
-11. `run()` 正常结束返回 `0`。
+8. 使用 `╭─ you` 和 `╰─ assistant` 风格展示输入提示和助手回复。
+9. 对每个回复片段立即写入输出流并 flush。
+10. 每轮回复结束后打印换行。
+11. 捕获 `MewCodeError`，打印可展示错误并继续输入循环。
+12. `run()` 正常结束返回 `0`。
 
 **验证：** 运行 `uv run pytest tests/test_tui.py`，期望欢迎信息、退出命令、空输入、流式 flush 和对话阶段错误测试通过。
 
@@ -195,7 +199,7 @@
 **依赖：** T5、T7、T10、T11  
 **步骤：**
 1. 在 `mewcode/cli.py` 实现 `main() -> int`。
-2. 加载用户级配置。
+2. 加载默认配置，按项目级优先、用户级回退的顺序查找。
 3. 创建 Provider。
 4. 创建 `ChatRuntime`。
 5. 创建并运行 `ChatApp`。
@@ -256,18 +260,31 @@
 **步骤：**
 1. 写明 MewCode 第一版能力边界：纯对话、无 tool use、无文件操作。
 2. 写明启动方式：`uv run mewcode`、`uv run python -m mewcode`。
-3. 提供 OpenAI 配置样例。
-4. 提供 Anthropic 配置样例。
-5. 说明 `thinking` 可省略，默认 `false`。
-6. 说明退出命令：`exit`、`quit` 或 Ctrl-D。
-7. 提醒不要把真实 API key 提交到仓库。
+3. 写明配置查找顺序：`./.mewcode/config.yaml` 优先，`~/.mewcode/config.yaml` 回退。
+4. 提供 OpenAI 配置样例。
+5. 提供 Anthropic 配置样例。
+6. 说明 `thinking` 可省略，默认 `false`。
+7. 说明退出命令：`exit`、`quit` 或 Ctrl-D。
+8. 提醒不要把真实 API key 提交到仓库。
 
-**验证：** 运行 `sed -n '1,220p' README.md`，期望能看到启动方式、配置路径、两类配置样例和能力边界。
+**验证：** 运行 `sed -n '1,220p' README.md`，期望能看到启动方式、配置查找顺序、两类配置样例和能力边界。
+
+## T18: 增加仓库协作说明和示例配置文件
+
+**文件：** `AGENTS.md`、`config.yaml.example`  
+**依赖：** T16  
+**步骤：**
+1. 在 `AGENTS.md` 写明首选使用 codebase-memory-mcp 做代码发现。
+2. 写明常用验证命令和配置文件优先级。
+3. 保持 `AGENTS.md` 少于 200 行。
+4. 在 `config.yaml.example` 提供无真实密钥的 OpenAI 示例和 Anthropic 备选示例。
+
+**验证：** 运行 `wc -l AGENTS.md config.yaml.example`，期望 `AGENTS.md` 少于 200 行，示例配置不含真实密钥。
 
 ## T17: 全量验证与格式检查
 
 **文件：** 全项目  
-**依赖：** T1-T16  
+**依赖：** T1-T16、T18  
 **步骤：**
 1. 运行全部测试。
 2. 运行 `uv run python -m mewcode` 的配置缺失启动检查。
@@ -295,7 +312,8 @@ T1
  -> T14
  -> T15
  -> T16
+ -> T18
  -> T17
 ```
 
-T13-T15 是测试补强任务，依赖对应实现后可局部并行；实际开发时仍按顺序跑验证，确保每步证据清楚。
+T13-T15 是测试补强任务，依赖对应实现后可局部并行；T18 是文档和样例补充，在 T16 后、T17 全量验证前执行。实际开发时仍按顺序跑验证，确保每步证据清楚。

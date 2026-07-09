@@ -1,4 +1,5 @@
 import pytest
+import httpx
 
 from mewcode.config import LLMConfig
 from mewcode.errors import ProviderError
@@ -134,6 +135,23 @@ def test_openai_provider_handles_error_event(openai_config):
 
     with pytest.raises(ProviderError, match="bad things"):
         list(provider.stream_chat([ChatMessage(role="user", content="Hi")]))
+
+
+def test_openai_provider_reports_connection_url_and_hint(openai_config):
+    class FailingHTTPClient:
+        def stream(self, method, url, **kwargs):
+            request = httpx.Request(method, url)
+            raise httpx.ConnectError("connection refused", request=request)
+
+    provider = OpenAIProvider(openai_config, http_client=FailingHTTPClient())
+
+    with pytest.raises(ProviderError) as exc_info:
+        list(provider.stream_chat([ChatMessage(role="user", content="Hi")]))
+
+    message = str(exc_info.value)
+    assert "https://api.openai.test/v1/responses" in message
+    assert "base_url" in message
+    assert "provider service is running" in message
 
 
 def test_anthropic_provider_builds_request_with_thinking_and_streams_text(anthropic_config):

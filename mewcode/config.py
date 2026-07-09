@@ -9,6 +9,7 @@ import yaml
 from .errors import ConfigError, redact_secrets
 from .providers.base import ProviderProtocol
 
+LOCAL_CONFIG_PATH = Path(".mewcode") / "config.yaml"
 CONFIG_PATH = Path.home() / ".mewcode" / "config.yaml"
 REQUIRED_FIELDS = ("name", "protocol", "model", "base_url", "api_key")
 
@@ -23,8 +24,8 @@ class LLMConfig:
     thinking: bool = False
 
 
-def load_config(path: Path = CONFIG_PATH) -> LLMConfig:
-    config_path = path.expanduser()
+def load_config(path: Path | None = None) -> LLMConfig:
+    config_path = _resolve_config_path(path)
     try:
         raw_text = config_path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
@@ -72,6 +73,22 @@ def load_config(path: Path = CONFIG_PATH) -> LLMConfig:
         )
     except ConfigError as exc:
         raise ConfigError(redact_secrets(exc.user_message, [api_key_for_redaction])) from exc
+
+
+def _resolve_config_path(path: Path | None) -> Path:
+    if path is not None:
+        return path.expanduser()
+
+    candidates = (LOCAL_CONFIG_PATH, Path.home() / ".mewcode" / "config.yaml")
+    for candidate in candidates:
+        config_path = candidate.expanduser()
+        if config_path.is_file():
+            return config_path
+
+    looked_in = ", ".join(str(candidate.expanduser()) for candidate in candidates)
+    raise ConfigError(
+        f"Config file not found. Looked in: {looked_in}. Create it with name, protocol, model, base_url, api_key, and optional thinking."
+    )
 
 
 def _required_string(data: dict[str, Any], field_name: str, path: Path) -> str:

@@ -54,8 +54,28 @@ def test_tui_streams_chunks_and_flushes():
     assert app.run() == 0
 
     assert runtime.inputs == ["Hi"]
-    assert "AI> Hello" in output.getvalue()
+    assert "╰─ assistant" in output.getvalue()
+    assert "Hello" in output.getvalue()
     assert output.flush_count >= 2
+
+
+def test_tui_renders_claude_like_header_with_cat():
+    runtime = FakeRuntime()
+    output = TrackingOutput()
+    app = ChatApp(
+        runtime,  # type: ignore[arg-type]
+        config(),
+        input_stream=StringIO("exit\n"),
+        output_stream=output,
+    )
+
+    assert app.run() == 0
+
+    text = output.getvalue()
+    assert "/\\_/\\" in text
+    assert "MewCode" in text
+    assert "openai" in text
+    assert "╭─ you" in text
 
 
 def test_tui_ignores_empty_input():
@@ -150,7 +170,8 @@ api_key: secret
     code = main(config_path=config_path, stdin=StringIO("Hi\nexit\n"), stdout=stdout, stderr=StringIO())
 
     assert code == 0
-    assert "AI> ok" in stdout.getvalue()
+    assert "╰─ assistant" in stdout.getvalue()
+    assert "ok" in stdout.getvalue()
 
 
 def test_tui_uses_uniform_runtime_interface_for_anthropic_config():
@@ -172,7 +193,8 @@ def test_tui_uses_uniform_runtime_interface_for_anthropic_config():
     )
 
     assert app.run() == 0
-    assert "AI> same" in output.getvalue()
+    assert "╰─ assistant" in output.getvalue()
+    assert "same" in output.getvalue()
 
 
 def test_end_to_end_history_with_fake_provider():

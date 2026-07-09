@@ -4,11 +4,12 @@ MewCode is a command-line AI chat assistant. This first version is intentionally
 
 ## Usage
 
-Create a user-level config file:
+Create a config file. MewCode first checks the current working directory, then
+falls back to the user-level config:
 
 ```bash
-mkdir -p ~/.mewcode
-$EDITOR ~/.mewcode/config.yaml
+mkdir -p .mewcode
+$EDITOR .mewcode/config.yaml
 ```
 
 Start MewCode:
@@ -27,11 +28,14 @@ Exit the session with `exit`, `quit`, or Ctrl-D.
 
 ## Configuration
 
-MewCode reads one active provider config from:
+MewCode reads one active provider config. Lookup order:
 
 ```text
+./.mewcode/config.yaml
 ~/.mewcode/config.yaml
 ```
+
+The project-local file wins when both exist.
 
 The supported fields are:
 
