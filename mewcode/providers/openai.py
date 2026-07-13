@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager
 from typing import Any
@@ -8,8 +9,18 @@ import httpx
 
 from mewcode.config import LLMConfig
 from mewcode.errors import ProviderError, redact_secrets
-from mewcode.providers.base import ChatMessage
+from mewcode.providers.base import (
+    AssistantMessage,
+    ConversationMessage,
+    ProviderEvent,
+    ResponseCompleted,
+    TextDelta,
+    ToolCallDelta,
+    ToolResultsMessage,
+    UserMessage,
+)
 from mewcode.providers.sse import iter_sse_events
+from mewcode.tools.base import ToolDefinition
 
 
 class OpenAIProvider:
@@ -17,24 +28,36 @@ class OpenAIProvider:
         self.config = config
         self._http_client = http_client
 
-    def stream_chat(self, messages: Sequence[ChatMessage]) -> Iterator[str]:
+    def stream_response(
+        self,
+        history: Sequence[ConversationMessage],
+        tools: Sequence[ToolDefinition],
+    ) -> Iterator[ProviderEvent]:
         url = f"{self.config.base_url}/responses"
-        body = {
+        body: dict[str, Any] = {
             "model": self.config.model,
-            "input": [{"role": message.role, "content": message.content} for message in messages],
+            "input": _serialize_history(history),
             "stream": True,
         }
+        if tools:
+            body["tools"] = [_serialize_tool(tool) for tool in tools]
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
         }
 
+        completed = False
         try:
             with self._stream("POST", url, headers=headers, json=body) as response:
                 self._raise_for_status(response)
                 for event in iter_sse_events(response):
-                    yield from self._text_chunks_from_event(event.data, event.event)
+                    for provider_event in _events_from_response(event.data, event.event):
+                        if isinstance(provider_event, ResponseCompleted):
+                            if completed:
+                                raise ProviderError("OpenAI response emitted more than one completed event.")
+                            completed = True
+                        yield provider_event
         except ProviderError as exc:
             raise ProviderError(redact_secrets(exc.user_message, [self.config.api_key])) from exc
         except httpx.HTTPError as exc:
@@ -42,6 +65,9 @@ class OpenAIProvider:
             raise ProviderError(
                 f"OpenAI request failed for {url}: {message}. Check that base_url is correct and the provider service is running."
             ) from exc
+
+        if not completed:
+            raise ProviderError("OpenAI response ended without a completed event.")
 
     def _stream(self, method: str, url: str, **kwargs: Any) -> AbstractContextManager[Any]:
         if self._http_client is not None:
@@ -53,22 +79,85 @@ class OpenAIProvider:
         status_code = getattr(response, "status_code", 200)
         if status_code < 400:
             return
-        body = _response_text(response)
-        raise ProviderError(f"OpenAI API returned HTTP {status_code}: {body}")
+        raise ProviderError(f"OpenAI API returned HTTP {status_code}: {_response_text(response)}")
 
-    def _text_chunks_from_event(self, data: dict[str, Any], event_name: str | None) -> Iterator[str]:
-        event_type = str(data.get("type") or event_name or "")
-        if event_name == "error" or event_type == "error" or "error" in data:
-            raise ProviderError(f"OpenAI API error: {_extract_error_message(data)}")
-        if event_type == "response.failed":
-            raise ProviderError(f"OpenAI response failed: {_extract_error_message(data)}")
 
-        if event_type in {"response.output_text.delta", "response.text.delta"} or event_type.endswith(
-            ".output_text.delta"
-        ):
-            delta = data.get("delta")
-            if isinstance(delta, str):
-                yield delta
+def _serialize_tool(tool: ToolDefinition) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.input_schema,
+    }
+
+
+def _serialize_history(history: Sequence[ConversationMessage]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for message in history:
+        if isinstance(message, UserMessage):
+            items.append({"role": "user", "content": message.content})
+        elif isinstance(message, AssistantMessage):
+            if not isinstance(message.provider_state, list):
+                raise ProviderError("OpenAI assistant protocol state is invalid.")
+            items.extend(message.provider_state)
+        elif isinstance(message, ToolResultsMessage):
+            for feedback in message.results:
+                items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": feedback.call_id,
+                        "output": json.dumps(
+                            feedback.result.to_model_payload(),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                    }
+                )
+    return items
+
+
+def _events_from_response(data: dict[str, Any], event_name: str | None) -> Iterator[ProviderEvent]:
+    event_type = str(data.get("type") or event_name or "")
+    if event_name == "error" or event_type == "error" or "error" in data:
+        raise ProviderError(f"OpenAI API error: {_extract_error_message(data)}")
+    if event_type == "response.failed":
+        raise ProviderError(f"OpenAI response failed: {_extract_error_message(data)}")
+
+    if event_type in {"response.output_text.delta", "response.text.delta"} or event_type.endswith(
+        ".output_text.delta"
+    ):
+        delta = data.get("delta")
+        if isinstance(delta, str):
+            yield TextDelta(delta)
+        return
+
+    if event_type == "response.output_item.added":
+        item = data.get("item")
+        slot = data.get("output_index")
+        if isinstance(item, dict) and item.get("type") == "function_call" and isinstance(slot, int):
+            call_id = item.get("call_id")
+            name = item.get("name")
+            yield ToolCallDelta(
+                slot,
+                call_id_delta=call_id if isinstance(call_id, str) else "",
+                name_delta=name if isinstance(name, str) else "",
+            )
+        return
+
+    if event_type == "response.function_call_arguments.delta":
+        slot = data.get("output_index")
+        delta = data.get("delta")
+        if isinstance(slot, int) and isinstance(delta, str):
+            yield ToolCallDelta(slot, arguments_delta=delta)
+        return
+
+    if event_type == "response.completed":
+        response = data.get("response")
+        output = response.get("output") if isinstance(response, dict) else None
+        if not isinstance(output, list):
+            raise ProviderError("OpenAI completed response did not include an output list.")
+        yield ResponseCompleted(output)
 
 
 class _ClosingStreamContext:
@@ -91,23 +180,20 @@ def _response_text(response: Any) -> str:
         read = getattr(response, "read", None)
         if callable(read):
             read()
-        text = getattr(response, "text", "")
-        return str(text)
+        return str(getattr(response, "text", ""))
     except Exception:
         return ""
 
 
 def _extract_error_message(data: dict[str, Any]) -> str:
     error = data.get("error")
-    if isinstance(error, dict):
-        message = error.get("message")
-        if isinstance(message, str):
-            return message
+    if isinstance(error, dict) and isinstance(error.get("message"), str):
+        return error["message"]
     if isinstance(error, str):
         return error
     response = data.get("response")
     if isinstance(response, dict):
-        nested_error = response.get("error")
-        if isinstance(nested_error, dict) and isinstance(nested_error.get("message"), str):
-            return nested_error["message"]
+        nested = response.get("error")
+        if isinstance(nested, dict) and isinstance(nested.get("message"), str):
+            return nested["message"]
     return str(data)

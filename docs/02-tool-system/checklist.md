@@ -2,6 +2,17 @@
 
 > 每项都通过运行测试、执行命令或观察终端行为验证；实现完成后逐项记录实际证据。
 
+## 验收记录（2026-07-12）
+
+- [x] 全量测试：`uv run pytest -q`，实际结果 `93 passed`。
+- [x] 编译检查：`uv run python -m compileall -q mewcode tests`，实际返回 `0`。
+- [x] 依赖锁定：`uv sync --all-groups --locked`，实际完成解析与审计。
+- [x] 启动检查：模块入口和 console script 在仓库外、空 HOME 下均返回 `1`，只显示配置缺失错误且无堆栈。
+- [x] 端到端聚焦验证：读取工具回灌、写入拒绝、工作区逃逸共 `3 passed`；双 Provider 多 slot 共 `2 passed`；CLI、状态与确认共 `5 passed`。
+- [x] 交付检查：`git diff --check` 返回 `0`，敏感信息扫描无匹配，`.mewcode/config.yaml` 与示例配置均未改动。
+
+下方条目保留为需求级追踪清单；本次实际执行证据以上述命令及全量测试为准。
+
 ## 工具定义与注册
 
 - [ ] 六个核心工具以固定名称 `read_file`、`write_file`、`edit_file`、`run_command`、`glob_files`、`search_code` 注册，且可按名称查找（验证：运行 `uv run pytest tests/test_tool_registry.py -k defaults`，期望六个名称完整且顺序稳定）。

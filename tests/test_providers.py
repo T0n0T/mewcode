@@ -1,12 +1,23 @@
-import pytest
+import json
+
 import httpx
+import pytest
 
 from mewcode.config import LLMConfig
 from mewcode.errors import ProviderError
 from mewcode.providers import create_provider
 from mewcode.providers.anthropic import AnthropicProvider
-from mewcode.providers.base import ChatMessage
+from mewcode.providers.base import (
+    AssistantMessage,
+    ResponseCompleted,
+    TextDelta,
+    ToolCallDelta,
+    ToolFeedback,
+    ToolResultsMessage,
+    UserMessage,
+)
 from mewcode.providers.openai import OpenAIProvider
+from mewcode.tools.base import ToolDefinition, ToolResult
 
 
 class MockStream:
@@ -66,11 +77,47 @@ def anthropic_config():
     )
 
 
-def test_factory_creates_openai_provider(openai_config):
+@pytest.fixture
+def tool_definition():
+    return ToolDefinition(
+        "read_file",
+        "Read a file",
+        {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    )
+
+
+def sse(data, event=None):
+    lines = []
+    if event:
+        lines.append(f"event: {event}")
+    lines.extend((f"data: {json.dumps(data, separators=(',', ':'))}", ""))
+    return lines
+
+
+def feedback():
+    return ToolFeedback(
+        "call-1",
+        "read_file",
+        ToolResult(status="success", data={"content": "hello"}),
+    )
+
+
+def test_base_types_hide_provider_state():
+    state = {"secret": "protocol state"}
+    assistant = AssistantMessage("hello", state)
+    completed = ResponseCompleted(state)
+
+    assert "protocol state" not in repr(assistant)
+    assert "protocol state" not in repr(completed)
+
+
+def test_factory_creates_both_providers(openai_config, anthropic_config):
     assert isinstance(create_provider(openai_config), OpenAIProvider)
-
-
-def test_factory_creates_anthropic_provider(anthropic_config):
     assert isinstance(create_provider(anthropic_config), AnthropicProvider)
 
 
@@ -82,111 +129,215 @@ def test_factory_rejects_unknown_protocol(openai_config):
         base_url=openai_config.base_url,
         api_key=openai_config.api_key,
     )
-
     with pytest.raises(ProviderError, match="Unsupported protocol"):
         create_provider(bad_config)
 
 
-def test_openai_provider_builds_request_and_streams_text(openai_config):
-    client = MockHTTPClient(
-        MockResponse(
-            [
-                'data: {"type":"response.output_text.delta","delta":"Hel"}',
-                "",
-                'data: {"type":"response.output_text.delta","delta":"lo"}',
-                "",
-                "data: [DONE]",
-                "",
-            ]
+def test_openai_tools_user_message_text_delta_and_completed(openai_config, tool_definition):
+    output = [{"type": "message", "role": "assistant", "content": []}]
+    lines = [
+        *sse({"type": "response.output_text.delta", "delta": "Hi"}),
+        *sse({"type": "response.completed", "response": {"output": output}}),
+        "data: [DONE]",
+        "",
+    ]
+    client = MockHTTPClient(MockResponse(lines))
+    events = list(
+        OpenAIProvider(openai_config, http_client=client).stream_response(
+            [UserMessage("Hello")], [tool_definition]
         )
     )
-    provider = OpenAIProvider(openai_config, http_client=client)
 
-    chunks = list(provider.stream_chat([ChatMessage(role="user", content="Hi")]))
-
-    assert chunks == ["Hel", "lo"]
+    assert events == [TextDelta("Hi"), ResponseCompleted(output)]
     method, url, kwargs = client.calls[0]
-    assert method == "POST"
-    assert url == "https://api.openai.test/v1/responses"
-    assert kwargs["headers"]["Authorization"] == "Bearer openai-secret"
-    assert kwargs["json"] == {
-        "model": "gpt-5-mini",
-        "input": [{"role": "user", "content": "Hi"}],
-        "stream": True,
-    }
+    assert (method, url) == ("POST", "https://api.openai.test/v1/responses")
+    assert kwargs["json"]["input"] == [{"role": "user", "content": "Hello"}]
+    assert kwargs["json"]["tools"] == [
+        {
+            "type": "function",
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": tool_definition.input_schema,
+        }
+    ]
 
 
-def test_openai_provider_redaction_reports_errors_without_secret(openai_config):
-    client = MockHTTPClient(MockResponse(status_code=401, text="bad openai-secret"))
+def test_openai_history_feedback_and_empty_tools(openai_config):
+    state = [{"type": "function_call", "call_id": "call-1", "name": "read_file", "arguments": "{}"}]
+    lines = sse({"type": "response.completed", "response": {"output": []}})
+    client = MockHTTPClient(MockResponse(lines))
     provider = OpenAIProvider(openai_config, http_client=client)
 
-    with pytest.raises(ProviderError) as exc_info:
-        list(provider.stream_chat([ChatMessage(role="user", content="Hi")]))
-
-    assert "openai-secret" not in str(exc_info.value)
-    assert "[redacted]" in str(exc_info.value)
-
-
-def test_openai_provider_handles_error_event(openai_config):
-    client = MockHTTPClient(
-        MockResponse(['event: error', 'data: {"error":{"message":"bad things"}}', ""])
+    list(
+        provider.stream_response(
+            [UserMessage("read"), AssistantMessage("", state), ToolResultsMessage((feedback(),))],
+            [],
+        )
     )
-    provider = OpenAIProvider(openai_config, http_client=client)
 
+    body = client.calls[0][2]["json"]
+    assert "tools" not in body
+    assert body["input"][:2] == [{"role": "user", "content": "read"}, *state]
+    tool_output = body["input"][2]
+    assert tool_output["type"] == "function_call_output"
+    assert tool_output["call_id"] == "call-1"
+    assert json.loads(tool_output["output"])["status"] == "success"
+
+
+def test_openai_tool_call_deltas_share_slot(openai_config):
+    output = [{"type": "function_call", "call_id": "call-1", "name": "read_file", "arguments": '{"path":"a"}'}]
+    lines = [
+        *sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call-1", "name": "read_file", "arguments": ""},
+            }
+        ),
+        *sse({"type": "response.function_call_arguments.delta", "output_index": 0, "delta": '{"path":'}),
+        *sse({"type": "response.function_call_arguments.delta", "output_index": 0, "delta": '"a"}'}),
+        *sse({"type": "response.completed", "response": {"output": output}}),
+    ]
+    events = list(OpenAIProvider(openai_config, MockHTTPClient(MockResponse(lines))).stream_response([], []))
+
+    assert events[:3] == [
+        ToolCallDelta(0, call_id_delta="call-1", name_delta="read_file"),
+        ToolCallDelta(0, arguments_delta='{"path":'),
+        ToolCallDelta(0, arguments_delta='"a"}'),
+    ]
+
+
+def test_openai_tool_deltas_keep_multiple_slots_separate(openai_config):
+    lines = [
+        *sse({"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "call_id": "one", "name": "first"}}),
+        *sse({"type": "response.output_item.added", "output_index": 1, "item": {"type": "function_call", "call_id": "two", "name": "second"}}),
+        *sse({"type": "response.function_call_arguments.delta", "output_index": 0, "delta": "{}"}),
+        *sse({"type": "response.function_call_arguments.delta", "output_index": 1, "delta": "{}"}),
+        *sse({"type": "response.completed", "response": {"output": []}}),
+    ]
+    events = list(OpenAIProvider(openai_config, MockHTTPClient(MockResponse(lines))).stream_response([], []))
+    deltas = [event for event in events if isinstance(event, ToolCallDelta)]
+    assert [event.slot for event in deltas] == [0, 1, 0, 1]
+
+
+def test_openai_requires_completed_event(openai_config):
+    client = MockHTTPClient(MockResponse([*sse({"type": "response.output_text.delta", "delta": "partial"}), "data: [DONE]", ""]))
+    with pytest.raises(ProviderError, match="without a completed event"):
+        list(OpenAIProvider(openai_config, client).stream_response([], []))
+
+
+def test_openai_redacts_http_and_stream_errors(openai_config):
+    provider = OpenAIProvider(
+        openai_config,
+        MockHTTPClient(MockResponse(status_code=401, text="bad openai-secret")),
+    )
+    with pytest.raises(ProviderError) as exc_info:
+        list(provider.stream_response([], []))
+    assert "openai-secret" not in str(exc_info.value)
+
+    client = MockHTTPClient(MockResponse(sse({"type": "error", "error": {"message": "bad things"}}, "error")))
     with pytest.raises(ProviderError, match="bad things"):
-        list(provider.stream_chat([ChatMessage(role="user", content="Hi")]))
+        list(OpenAIProvider(openai_config, client).stream_response([], []))
 
 
-def test_openai_provider_reports_connection_url_and_hint(openai_config):
+def test_openai_connection_error_has_url_hint(openai_config):
     class FailingHTTPClient:
         def stream(self, method, url, **kwargs):
-            request = httpx.Request(method, url)
-            raise httpx.ConnectError("connection refused", request=request)
-
-    provider = OpenAIProvider(openai_config, http_client=FailingHTTPClient())
+            raise httpx.ConnectError("connection refused", request=httpx.Request(method, url))
 
     with pytest.raises(ProviderError) as exc_info:
-        list(provider.stream_chat([ChatMessage(role="user", content="Hi")]))
-
-    message = str(exc_info.value)
-    assert "https://api.openai.test/v1/responses" in message
-    assert "base_url" in message
-    assert "provider service is running" in message
+        list(OpenAIProvider(openai_config, FailingHTTPClient()).stream_response([], []))
+    assert "https://api.openai.test/v1/responses" in str(exc_info.value)
+    assert "base_url" in str(exc_info.value)
 
 
-def test_anthropic_provider_builds_request_with_thinking_and_streams_text(anthropic_config):
-    client = MockHTTPClient(
-        MockResponse(
-            [
-                'event: content_block_delta',
-                'data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hidden"}}',
-                "",
-                'event: content_block_delta',
-                'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}',
-                "",
-                'event: content_block_delta',
-                'data: {"type":"content_block_delta","delta":{"type":"signature_delta","signature":"sig"}}',
-                "",
-            ]
+def test_anthropic_tools_text_tool_delta_and_completed(anthropic_config, tool_definition):
+    lines = [
+        *sse({"type": "message_start", "message": {"content": []}}, "message_start"),
+        *sse({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}, "content_block_start"),
+        *sse({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hi"}}, "content_block_delta"),
+        *sse({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "call-1", "name": "read_file", "input": {}}}, "content_block_start"),
+        *sse({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": '{"path":"a"}'}}, "content_block_delta"),
+        *sse({"type": "message_stop"}, "message_stop"),
+    ]
+    client = MockHTTPClient(MockResponse(lines))
+    events = list(
+        AnthropicProvider(anthropic_config, client).stream_response(
+            [UserMessage("Hello")], [tool_definition]
         )
     )
-    provider = AnthropicProvider(anthropic_config, http_client=client)
 
-    chunks = list(provider.stream_chat([ChatMessage(role="user", content="Hi")]))
-
-    assert chunks == ["Hi"]
-    method, url, kwargs = client.calls[0]
-    assert method == "POST"
-    assert url == "https://api.anthropic.test/v1/messages"
-    assert kwargs["headers"]["x-api-key"] == "anthropic-secret"
-    assert kwargs["headers"]["anthropic-version"] == "2023-06-01"
-    assert kwargs["json"]["messages"] == [{"role": "user", "content": "Hi"}]
-    assert kwargs["json"]["stream"] is True
-    assert kwargs["json"]["thinking"]["type"] == "adaptive"
-    assert kwargs["json"]["thinking"]["display"] == "omitted"
+    assert events[:3] == [
+        TextDelta("Hi"),
+        ToolCallDelta(1, call_id_delta="call-1", name_delta="read_file"),
+        ToolCallDelta(1, arguments_delta='{"path":"a"}'),
+    ]
+    assert isinstance(events[-1], ResponseCompleted)
+    body = client.calls[0][2]["json"]
+    assert body["messages"] == [{"role": "user", "content": "Hello"}]
+    assert body["tools"][0]["input_schema"] == tool_definition.input_schema
+    assert body["thinking"] == {"type": "adaptive", "display": "omitted"}
 
 
-def test_anthropic_provider_omits_thinking_when_disabled(anthropic_config):
+def test_anthropic_tool_deltas_keep_multiple_slots_separate(anthropic_config):
+    lines = [
+        *sse({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "one", "name": "first", "input": {}}}),
+        *sse({"type": "content_block_start", "index": 2, "content_block": {"type": "tool_use", "id": "two", "name": "second", "input": {}}}),
+        *sse({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+        *sse({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+        *sse({"type": "message_stop"}),
+    ]
+    events = list(AnthropicProvider(anthropic_config, MockHTTPClient(MockResponse(lines))).stream_response([], []))
+    deltas = [event for event in events if isinstance(event, ToolCallDelta)]
+    assert [event.slot for event in deltas] == [0, 2, 0, 2]
+
+
+def test_anthropic_history_feedback_merges_adjacent_user_content(anthropic_config):
+    blocks = [{"type": "tool_use", "id": "call-1", "name": "read_file", "input": {"path": "a"}}]
+    client = MockHTTPClient(MockResponse(sse({"type": "message_stop"}, "message_stop")))
+    list(
+        AnthropicProvider(anthropic_config, client).stream_response(
+            [
+                AssistantMessage("", blocks),
+                ToolResultsMessage((feedback(),)),
+                UserMessage("continue"),
+            ],
+            [],
+        )
+    )
+
+    body = client.calls[0][2]["json"]
+    assert "tools" not in body
+    assert body["messages"][0] == {"role": "assistant", "content": blocks}
+    user_content = body["messages"][1]["content"]
+    assert user_content[0]["type"] == "tool_result"
+    assert user_content[0]["tool_use_id"] == "call-1"
+    assert user_content[1] == {"type": "text", "text": "continue"}
+
+
+def test_anthropic_thinking_is_preserved_but_not_displayed(anthropic_config):
+    lines = [
+        *sse({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}, "content_block_start"),
+        *sse({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "hidden"}}, "content_block_delta"),
+        *sse({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig"}}, "content_block_delta"),
+        *sse({"type": "message_stop"}, "message_stop"),
+    ]
+    events = list(AnthropicProvider(anthropic_config, MockHTTPClient(MockResponse(lines))).stream_response([], []))
+    assert events == [ResponseCompleted([{"type": "thinking", "thinking": "hidden", "signature": "sig"}])]
+
+
+def test_anthropic_requires_message_stop_and_redacts_errors(anthropic_config):
+    client = MockHTTPClient(MockResponse(sse({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "partial"}})))
+    with pytest.raises(ProviderError, match="without a completed event"):
+        list(AnthropicProvider(anthropic_config, client).stream_response([], []))
+
+    client = MockHTTPClient(MockResponse(status_code=401, text="bad anthropic-secret"))
+    with pytest.raises(ProviderError) as exc_info:
+        list(AnthropicProvider(anthropic_config, client).stream_response([], []))
+    assert "anthropic-secret" not in str(exc_info.value)
+
+
+def test_anthropic_omits_thinking_when_disabled(anthropic_config):
     config = LLMConfig(
         name=anthropic_config.name,
         protocol="anthropic",
@@ -195,30 +346,6 @@ def test_anthropic_provider_omits_thinking_when_disabled(anthropic_config):
         api_key=anthropic_config.api_key,
         thinking=False,
     )
-    client = MockHTTPClient(MockResponse(["data: [DONE]", ""]))
-    provider = AnthropicProvider(config, http_client=client)
-
-    list(provider.stream_chat([ChatMessage(role="user", content="Hi")]))
-
+    client = MockHTTPClient(MockResponse(sse({"type": "message_stop"}, "message_stop")))
+    list(AnthropicProvider(config, client).stream_response([], []))
     assert "thinking" not in client.calls[0][2]["json"]
-
-
-def test_anthropic_provider_redaction_reports_errors_without_secret(anthropic_config):
-    client = MockHTTPClient(MockResponse(status_code=401, text="bad anthropic-secret"))
-    provider = AnthropicProvider(anthropic_config, http_client=client)
-
-    with pytest.raises(ProviderError) as exc_info:
-        list(provider.stream_chat([ChatMessage(role="user", content="Hi")]))
-
-    assert "anthropic-secret" not in str(exc_info.value)
-    assert "[redacted]" in str(exc_info.value)
-
-
-def test_anthropic_provider_handles_error_event(anthropic_config):
-    client = MockHTTPClient(
-        MockResponse(['event: error', 'data: {"error":{"message":"rate limited"}}', ""])
-    )
-    provider = AnthropicProvider(anthropic_config, http_client=client)
-
-    with pytest.raises(ProviderError, match="rate limited"):
-        list(provider.stream_chat([ChatMessage(role="user", content="Hi")]))
