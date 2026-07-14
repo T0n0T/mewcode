@@ -44,10 +44,11 @@ uv run python -m mewcode
 ### Terminal interface
 
 When standard input and output are both real TTYs, MewCode opens a full-screen,
-keyboard-first interface with a session header, scrollable conversation, and
-persistent multiline composer. Piped input, redirected output, and injected
-test streams automatically use plain linear output without color, animation,
-or full-screen control sequences.
+keyboard-first interface with a scrollable conversation, persistent multiline
+composer, and compact session footer below it. On normal terminal sizes, a
+one-cell safe margin keeps the interface away from every terminal edge. Piped
+input, redirected output, and injected test streams automatically use plain
+linear output without color, animation, or full-screen control sequences.
 
 Fullscreen controls:
 

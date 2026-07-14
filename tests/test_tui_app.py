@@ -5,6 +5,7 @@ from threading import Event
 
 import pytest
 from textual.css.query import NoMatches
+from textual.geometry import Spacing
 from textual.widgets import Markdown, Static
 
 from mewcode.errors import MewCodeError
@@ -40,8 +41,9 @@ from mewcode.tui.widgets import (
     ConfirmationModal,
     ConversationView,
     ErrorCard,
+    NewOutputIndicator,
     PromptComposer,
-    SessionHeader,
+    SessionFooter,
     ToolCard,
     UserMessageView,
     WelcomeCard,
@@ -98,9 +100,68 @@ async def test_css_resource_loads_in_headless_app(tmp_path):
     )
 
     async with app.run_test(size=(80, 24)):
-        assert app.query_one(SessionHeader)
+        assert app.query_one(SessionFooter)
         assert app.query_one(WelcomeCard)
         assert app.query_one(PromptComposer).has_focus is True
+
+
+@pytest.mark.asyncio
+async def test_compose_order_places_status_below_composer(tmp_path):
+    app = CyberpunkChatApp(
+        None,  # type: ignore[arg-type]
+        metadata(tmp_path),
+        TuiEventBridge(),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        children = list(app.screen.children)
+
+        assert isinstance(children[0], ConversationView)
+        assert isinstance(children[1], NewOutputIndicator)
+        assert children[2].id == "composer-shell"
+        assert isinstance(children[3], SessionFooter)
+        assert children[4].id == "size-warning"
+
+        composer_shell = app.query_one("#composer-shell")
+        footer = app.query_one(SessionFooter)
+        assert composer_shell.region.bottom == footer.region.y
+
+
+@pytest.mark.asyncio
+async def test_screen_padding_keeps_content_one_cell_from_terminal_edges(tmp_path):
+    app = CyberpunkChatApp(
+        None,  # type: ignore[arg-type]
+        metadata(tmp_path),
+        TuiEventBridge(),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        footer = app.query_one(SessionFooter)
+
+        assert app.screen.styles.padding == Spacing(1, 1, 1, 1)
+        assert footer.region.bottom == app.size.height - 1
+
+
+@pytest.mark.asyncio
+async def test_new_output_stays_above_composer_and_footer(tmp_path):
+    app = CyberpunkChatApp(
+        None,  # type: ignore[arg-type]
+        metadata(tmp_path),
+        TuiEventBridge(),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        new_output = app.query_one(NewOutputIndicator)
+        new_output.set_count(1)
+        await pilot.pause()
+
+        composer_shell = app.query_one("#composer-shell")
+        footer = app.query_one(SessionFooter)
+        assert new_output.region.bottom <= composer_shell.region.y
+        assert composer_shell.region.bottom == footer.region.y
+        assert footer.region.bottom == app.size.height - 1
 
 
 def metadata(tmp_path):
@@ -436,7 +497,8 @@ async def test_error_card_preserves_partial_output_and_restores_input(tmp_path):
 
         assert app.query_one(AssistantMessageView).query_one(Markdown).source == "partial"
         assert "temporary failure" in str(app.query_one(ErrorCard).title)
-        assert app.activity_state is ActivityState.READY
+        assert app.activity_state is ActivityState.ERROR
+        assert app.query_one("#connection-status", Static).render().plain == "ERROR"
         assert app.query_one(PromptComposer).busy is False
 
 
@@ -447,7 +509,7 @@ class UnexpectedFailingRuntime:
 
 
 @pytest.mark.asyncio
-async def test_unexpected_error_is_sanitized_and_restores_ready(tmp_path):
+async def test_unexpected_error_is_sanitized_and_sets_error_status(tmp_path):
     app = CyberpunkChatApp(
         UnexpectedFailingRuntime(),  # type: ignore[arg-type]
         metadata(tmp_path),
@@ -465,7 +527,8 @@ async def test_unexpected_error_is_sanitized_and_restores_ready(tmp_path):
         assert "restart MewCode" in card.query_one(
             ".error-suggestion", Static
         ).render().plain
-        assert app.activity_state is ActivityState.READY
+        assert app.activity_state is ActivityState.ERROR
+        assert app.query_one("#connection-status", Static).render().plain == "ERROR"
         assert app.query_one(PromptComposer).busy is False
 
 
@@ -724,20 +787,41 @@ async def test_responsive_classes_and_ascii_messages(tmp_path):
 
     async with app.run_test(size=(120, 36)) as pilot:
         composer = app.query_one(PromptComposer)
+        footer = app.query_one(SessionFooter)
+        branch = app.query_one("#footer-branch", Static)
+        workspace = app.query_one("#footer-workspace", Static)
+        new_output = app.query_one(NewOutputIndicator)
         composer.load_text("draft survives resize")
         await app.query_one(ConversationView).append_widget(
             UserMessageView("existing", unicode=False)
         )
         assert "wide" in app.screen.classes
+        assert branch.display is True
+        assert workspace.display is True
         await pilot.resize_terminal(80, 24)
         assert "compact" in app.screen.classes
+        assert branch.display is False
+        assert workspace.display is True
         await pilot.resize_terminal(60, 18)
         assert "narrow" in app.screen.classes
+        assert branch.display is False
+        assert workspace.display is False
+        new_output.set_count(1)
         await pilot.resize_terminal(40, 10)
         assert "too-small" in app.screen.classes
+        assert app.query_one(ConversationView).display is False
+        assert new_output.display is False
+        assert app.query_one("#composer-shell").display is False
+        assert footer.display is False
+        assert app.query_one("#size-warning", Static).display is True
+        new_output.set_count(2)
+        assert new_output.display is False
         await pilot.resize_terminal(80, 24)
 
         assert composer.text == "draft survives resize"
+        assert footer.display is True
+        assert new_output.display is True
+        assert composer.has_focus is True
         assert app.query_one(UserMessageView).render().plain == "> existing"
         assert app.query_one("#brand", Static).render().plain == "* MEWCODE"
         assert composer.placeholder == "Describe a task..."
@@ -878,7 +962,7 @@ async def test_read_tool_result_is_sent_to_model_but_hidden_from_tui(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_compact_header_keeps_status_visible_with_long_workspace():
+async def test_compact_footer_keeps_status_visible_with_long_workspace():
     long_workspace = Path(
         "/home/developer/Documents/code/agent/mydemo/mewcode"
     )
@@ -904,7 +988,7 @@ async def test_compact_header_keeps_status_visible_with_long_workspace():
 
 
 @pytest.mark.asyncio
-async def test_narrow_header_truncates_long_model_before_status():
+async def test_narrow_footer_truncates_long_model_before_status():
     app = CyberpunkChatApp(
         None,  # type: ignore[arg-type]
         SessionMetadata(
@@ -919,10 +1003,34 @@ async def test_narrow_header_truncates_long_model_before_status():
 
     async with app.run_test(size=(60, 18)) as pilot:
         await pilot.pause()
-        model = app.query_one("#header-model", Static)
+        model = app.query_one("#footer-model", Static)
         status = app.query_one("#connection-status", Static)
 
         assert status.region.width >= len("READY")
+        assert model.region.right <= status.region.x
+
+
+@pytest.mark.asyncio
+async def test_minimum_width_footer_keeps_active_status_separate_from_model():
+    app = CyberpunkChatApp(
+        None,  # type: ignore[arg-type]
+        SessionMetadata(
+            "test",
+            "openai",
+            "model-with-an-extremely-long-version-and-variant-name",
+            Path("/workspace/mewcode"),
+            "main",
+        ),
+        TuiEventBridge(),
+    )
+
+    async with app.run_test(size=(48, 14)) as pilot:
+        app.query_one(SessionFooter).set_status(ActivityState.UPLINKING)
+        await pilot.pause()
+        model = app.query_one("#footer-model", Static)
+        status = app.query_one("#connection-status", Static)
+
+        assert status.render().plain == "UPLINKING"
         assert model.region.right <= status.region.x
 
 

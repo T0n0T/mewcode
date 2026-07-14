@@ -16,7 +16,7 @@ from mewcode.tui.metadata import SessionMetadata
 from mewcode.tui.widgets.chrome import (
     ActivityIndicator,
     NewOutputIndicator,
-    SessionHeader,
+    SessionFooter,
     WelcomeCard,
 )
 from mewcode.tui.widgets.composer import PromptComposer, PromptHistory
@@ -46,35 +46,35 @@ class ChromeApp(App[None]):
         self.branch = branch
 
     def compose(self) -> ComposeResult:
-        yield SessionHeader(metadata(self.branch))
+        yield SessionFooter(metadata(self.branch))
         yield WelcomeCard(metadata(self.branch))
 
 
 @pytest.mark.asyncio
-async def test_header_renders_session_fields_and_updates_activity():
+async def test_footer_renders_session_fields_and_updates_activity():
     app = ChromeApp()
 
     async with app.run_test():
-        header = app.query_one(SessionHeader)
-        assert "MEWCODE" in header.query_one("#brand", Static).render().plain
-        assert "gpt-cyber" in header.query_one("#header-model", Static).render().plain
-        assert "/workspace/project" in header.query_one(
-            "#header-workspace", Static
+        footer = app.query_one(SessionFooter)
+        assert "MEWCODE" in footer.query_one("#brand", Static).render().plain
+        assert "gpt-cyber" in footer.query_one("#footer-model", Static).render().plain
+        assert "/workspace/project" in footer.query_one(
+            "#footer-workspace", Static
         ).render().plain
-        assert "git:main" in header.query_one("#header-branch", Static).render().plain
+        assert "git:main" in footer.query_one("#footer-branch", Static).render().plain
 
-        header.set_activity(ActivityState.UPLINKING, "gpt-cyber")
-        assert header.query_one("#connection-status", Static).render().plain == (
-            "UPLINKING:gpt-cyber"
+        footer.set_status(ActivityState.UPLINKING)
+        assert footer.query_one("#connection-status", Static).render().plain == (
+            "UPLINKING"
         )
 
 
 @pytest.mark.asyncio
-async def test_header_and_welcome_degrade_without_branch_or_secret():
+async def test_footer_and_welcome_degrade_without_branch_or_secret():
     app = ChromeApp(branch=None)
 
     async with app.run_test():
-        assert app.query_one("#header-branch", Static).render().plain == ""
+        assert app.query_one("#footer-branch", Static).render().plain == ""
         welcome = app.query_one(WelcomeCard).render().plain
         assert "MEWCODE // CYBER TERMINAL" in welcome
         assert "gpt-cyber" in welcome

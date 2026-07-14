@@ -12,13 +12,13 @@ from mewcode.tui.events import ActivityState
 from mewcode.tui.metadata import SessionMetadata
 
 
-class SessionHeader(Horizontal):
+class SessionFooter(Horizontal):
     def __init__(
         self,
         metadata: SessionMetadata,
         *,
         unicode: bool = True,
-        id: str | None = "session-header",
+        id: str | None = "session-footer",
     ) -> None:
         super().__init__(id=id)
         self.metadata = metadata
@@ -26,10 +26,10 @@ class SessionHeader(Horizontal):
 
     def compose(self) -> ComposeResult:
         yield Static(f"{self._brand_marker} MEWCODE", id="brand")
-        yield Static(f"model:{self.metadata.model}", id="header-model")
+        yield Static(f"model:{self.metadata.model}", id="footer-model")
         yield Static(
             f"workspace:{self.metadata.workspace}",
-            id="header-workspace",
+            id="footer-workspace",
             classes="compact-only",
         )
         branch = (
@@ -37,18 +37,11 @@ class SessionHeader(Horizontal):
             if self.metadata.git_branch is not None
             else ""
         )
-        yield Static(branch, id="header-branch", classes="wide-only")
+        yield Static(branch, id="footer-branch", classes="wide-only")
         yield Static("READY", id="connection-status")
 
-    def set_activity(
-        self,
-        state: ActivityState,
-        detail: str | None = None,
-    ) -> None:
-        text = state.value.upper()
-        if detail:
-            text = f"{text}:{detail}"
-        self.query_one("#connection-status", Static).update(text)
+    def set_status(self, state: ActivityState) -> None:
+        self.query_one("#connection-status", Static).update(state.value.upper())
 
 
 class WelcomeCard(Static):
@@ -143,6 +136,7 @@ class NewOutputIndicator(Button):
         self._arrow = "↓" if unicode else "v"
         super().__init__(f"NEW OUTPUT {self._arrow}", id="new-output")
         self.count = 0
+        self._size_hidden = False
         self.display = False
 
     def set_count(self, count: int) -> None:
@@ -152,7 +146,14 @@ class NewOutputIndicator(Button):
             if self.count
             else f"NEW OUTPUT {self._arrow}"
         )
-        self.display = self.count > 0
+        self._refresh_visibility()
+
+    def set_size_hidden(self, hidden: bool) -> None:
+        self._size_hidden = hidden
+        self._refresh_visibility()
+
+    def _refresh_visibility(self) -> None:
+        self.display = self.count > 0 and not self._size_hidden
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button is self:

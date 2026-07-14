@@ -3,7 +3,7 @@
 from mewcode.tui.widgets.chrome import (
     ActivityIndicator,
     NewOutputIndicator,
-    SessionHeader,
+    SessionFooter,
     WelcomeCard,
 )
 from mewcode.tui.widgets.composer import PromptComposer, PromptHistory
@@ -25,7 +25,7 @@ __all__ = [
     "NewOutputIndicator",
     "PromptHistory",
     "PromptComposer",
-    "SessionHeader",
+    "SessionFooter",
     "ToolCard",
     "UserMessageView",
     "WelcomeCard",

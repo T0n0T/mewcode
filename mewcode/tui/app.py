@@ -42,7 +42,7 @@ from mewcode.tui.widgets import (
     ErrorCard,
     NewOutputIndicator,
     PromptComposer,
-    SessionHeader,
+    SessionFooter,
     ToolCard,
     UserMessageView,
     WelcomeCard,
@@ -107,12 +107,12 @@ class CyberpunkChatApp(App[int]):
         self._interrupted_generations: set[int] = set()
 
     def compose(self) -> ComposeResult:
-        yield SessionHeader(self.metadata, unicode=self.unicode_output)
         yield ConversationView(WelcomeCard(self.metadata))
         yield NewOutputIndicator(unicode=self.unicode_output)
         with Container(id="composer-shell"):
             yield Static("", id="exit-hint")
             yield PromptComposer(unicode=self.unicode_output)
+        yield SessionFooter(self.metadata, unicode=self.unicode_output)
         yield Static(
             (
                 "Terminal too small — resize to at least 48×14."
@@ -325,7 +325,7 @@ class CyberpunkChatApp(App[int]):
         await self.query_one(ConversationView).append_widget(
             ErrorCard(message.payload, unicode=self.unicode_output)
         )
-        self._finish_turn(ActivityState.READY)
+        self._finish_turn(ActivityState.ERROR)
 
     async def on_tool_started_message(self, message: ToolStartedMessage) -> None:
         payload = message.payload
@@ -452,6 +452,7 @@ class CyberpunkChatApp(App[int]):
             screen.add_class("compact")
         else:
             screen.add_class("narrow")
+        self.query_one(NewOutputIndicator).set_size_hidden(is_too_small)
         if was_too_small and not is_too_small and self.screen is screen:
             self.call_after_refresh(self.query_one(PromptComposer).focus)
 
@@ -464,7 +465,7 @@ class CyberpunkChatApp(App[int]):
             self._activity = ActivityIndicator(unicode=self.unicode_output)
             await self.query_one(ConversationView).append_widget(self._activity)
         self._activity.set_activity(state, detail)
-        self._set_activity(state, detail)
+        self._set_activity(state)
 
     async def _remove_activity(self) -> None:
         if self._activity is not None:
@@ -483,13 +484,9 @@ class CyberpunkChatApp(App[int]):
         elif self._activity is not None:
             self._activity.set_activity(ActivityState.INTERRUPTED)
 
-    def _set_activity(
-        self,
-        state: ActivityState,
-        detail: str | None = None,
-    ) -> None:
+    def _set_activity(self, state: ActivityState) -> None:
         self.activity_state = state
-        self.query_one(SessionHeader).set_activity(state, detail)
+        self.query_one(SessionFooter).set_status(state)
 
     def _finish_turn(self, state: ActivityState) -> None:
         if self._active_generation is not None:
