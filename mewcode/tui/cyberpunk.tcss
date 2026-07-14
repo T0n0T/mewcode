@@ -1,0 +1,116 @@
+$background: #080b10;
+$surface: #101620;
+$surface-raised: #151e2b;
+$text: #d7e2f0;
+$muted: #607089;
+$cyan: #00e5ff;
+$magenta: #ff3cac;
+$success: #3bf7a3;
+$warning: #ffb454;
+$error: #ff5d73;
+
+Screen {
+    background: $background;
+    color: $text;
+    layout: vertical;
+}
+
+#app-placeholder {
+    width: 100%;
+    height: 100%;
+    content-align: center middle;
+    color: $cyan;
+    text-style: bold;
+}
+
+#session-header {
+    width: 100%;
+    height: 3;
+    padding: 0 1;
+    background: $surface;
+    border-bottom: solid $cyan;
+}
+
+#conversation {
+    width: 100%;
+    height: 1fr;
+    padding: 1 2;
+    scrollbar-color: $cyan;
+    scrollbar-color-hover: $magenta;
+}
+
+#composer-shell {
+    width: 100%;
+    height: auto;
+    min-height: 3;
+    max-height: 8;
+    padding: 0 1;
+    background: $surface;
+    border-top: solid $cyan;
+}
+
+.card {
+    width: 100%;
+    height: auto;
+    margin-bottom: 1;
+    padding: 0 1;
+    background: $surface-raised;
+    border-left: tall $muted;
+}
+
+.tool-card {
+    border-left: tall $cyan;
+}
+
+.error-card {
+    border-left: tall $error;
+}
+
+.activity {
+    color: $cyan;
+    text-style: bold;
+}
+
+.status-success {
+    color: $success;
+}
+
+.status-warning {
+    color: $warning;
+}
+
+.status-error {
+    color: $error;
+}
+
+Screen.compact .wide-only,
+Screen.narrow .wide-only,
+Screen.narrow .compact-only {
+    display: none;
+}
+
+Screen.too-small #session-header,
+Screen.too-small #conversation,
+Screen.too-small #composer-shell {
+    display: none;
+}
+
+Screen.no-color {
+    background: black;
+    color: white;
+}
+
+Screen.no-color #session-header {
+    background: black;
+    border-bottom: solid white;
+}
+
+Screen.no-color #composer-shell {
+    background: black;
+    border-top: solid white;
+}
+
+Screen.no-color .card {
+    background: black;
+    border-left: solid white;
+}
