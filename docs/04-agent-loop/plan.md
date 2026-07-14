@@ -528,6 +528,7 @@ class CollectedResponse:
 
 ```python
 TextSink = Callable[[str], Awaitable[None]]
+StreamStartedSink = Callable[[], Awaitable[None]]
 
 
 class ResponseCollector:
@@ -543,6 +544,7 @@ class ResponseCollector:
         instructions: str,
         cancellation: CancellationToken,
         on_text: TextSink,
+        on_stream_started: StreamStartedSink,
     ) -> CollectedResponse:
         ...
 ```
@@ -550,12 +552,13 @@ class ResponseCollector:
 工作顺序：
 
 1. 调用 Provider 异步流。
-2. 每个文本增量先追加到内部文本列表，再 `await on_text(text)`。
-3. `on_text` 由 `AgentRun` 实现，发布 `TextDeltaEvent`；等待发布自然形成背压。
-4. 工具增量按槽位拼接调用 ID、名称和参数；缺失调用 ID 使用 `run_id`、`iteration` 与槽位生成。
-5. 完成事件到达后保存不透明状态与真实用量。
-6. 流结束时验证唯一完成事件、调用 ID 唯一性和槽位稳定性。
-7. 返回 `CollectedResponse`，由 Agent Loop 决定自然完成或进入工具调度。
+2. 首个 Provider 事件到达时先 `await on_stream_started()`，使 `AgentRun` 切换到接收阶段；纯工具响应同样触发且每轮只触发一次。
+3. 每个文本增量先追加到内部文本列表，再 `await on_text(text)`。
+4. `on_text` 由 `AgentRun` 实现，发布 `TextDeltaEvent`；等待发布自然形成背压。
+5. 工具增量按槽位拼接调用 ID、名称和参数；缺失调用 ID 使用 `run_id`、`iteration` 与槽位生成。
+6. 完成事件到达后保存不透明状态与真实用量。
+7. 流结束时验证唯一完成事件、调用 ID 唯一性和槽位稳定性。
+8. 返回 `CollectedResponse`，由 Agent Loop 决定自然完成或进入工具调度。
 
 历史提交规则：
 
