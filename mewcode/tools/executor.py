@@ -1,24 +1,24 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import time
-import signal
-import threading
-from contextlib import contextmanager
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
-from typing import Protocol
 
 from jsonschema import Draft202012Validator
 
+from mewcode.cancellation import CancellationToken
 from mewcode.errors import DeadlineExceeded, ToolFailure, redact_secrets
-from mewcode.providers.base import ToolCall
 from mewcode.tools.base import (
     ConfirmationPreview,
     Deadline,
     JSONValue,
     ToolContext,
+    ToolCall,
     ToolErrorInfo,
     ToolOutputLimits,
+    ToolPresentation,
     ToolResult,
     TruncationInfo,
 )
@@ -26,28 +26,7 @@ from mewcode.tools.registry import ToolRegistry
 from mewcode.tools.workspace import Workspace
 
 
-class ToolInteraction(Protocol):
-    def tool_started(self, call: ToolCall) -> None: ...
-
-    def confirm(self, preview: ConfirmationPreview) -> bool: ...
-
-    def tool_finished(self, call: ToolCall, result: ToolResult) -> None: ...
-
-    def tool_budget_exhausted(self) -> None: ...
-
-
-class NullToolInteraction:
-    def tool_started(self, call: ToolCall) -> None:
-        return None
-
-    def confirm(self, preview: ConfirmationPreview) -> bool:
-        return False
-
-    def tool_finished(self, call: ToolCall, result: ToolResult) -> None:
-        return None
-
-    def tool_budget_exhausted(self) -> None:
-        return None
+ConfirmationHandler = Callable[[ToolCall, ConfirmationPreview], Awaitable[bool]]
 
 
 class ToolExecutor:
@@ -55,7 +34,6 @@ class ToolExecutor:
         self,
         registry: ToolRegistry,
         workspace: Workspace,
-        interaction: ToolInteraction | None = None,
         *,
         limits: ToolOutputLimits | None = None,
         secrets: tuple[str, ...] = (),
@@ -64,29 +42,49 @@ class ToolExecutor:
     ):
         self.registry = registry
         self.workspace = workspace
-        self.interaction = interaction or NullToolInteraction()
         self.limits = limits or ToolOutputLimits()
         self.secrets = secrets
         self._clock = clock
         self.ordinary_timeout_seconds = ordinary_timeout_seconds
 
-    def execute(self, call: ToolCall) -> ToolResult:
+    def presentation(
+        self,
+        name: str,
+        arguments: Mapping[str, JSONValue],
+    ) -> ToolPresentation:
+        safe_arguments = _redact_value(dict(arguments), self.secrets)
+        summary = json.dumps(safe_arguments, ensure_ascii=False, sort_keys=True)
+        return ToolPresentation(name=name[:80], argument_summary=summary[:512])
+
+    def sanitize_preview(self, preview: ConfirmationPreview) -> ConfirmationPreview:
+        return replace(
+            preview,
+            title=redact_secrets(preview.title, self.secrets),
+            details=redact_secrets(preview.details, self.secrets),
+        )
+
+    async def execute(
+        self,
+        call: ToolCall,
+        *,
+        cancellation: CancellationToken,
+        confirm: ConfirmationHandler,
+    ) -> ToolResult:
+        cancellation.raise_if_cancelled()
         started = self._clock()
-        display_call = replace(call, arguments=_redact_value(call.arguments, self.secrets))
-        self.interaction.tool_started(display_call)
         try:
             tool = self.registry.get(call.name)
             manages_own_timeout = bool(
                 tool is not None and getattr(tool, "manages_own_timeout", False)
             )
-            with _hard_deadline(
-                None if manages_own_timeout else self.ordinary_timeout_seconds
-            ):
-                result = self._execute(call)
-        except DeadlineExceeded as exc:
+            timeout = None if manages_own_timeout else self.ordinary_timeout_seconds
+            async with asyncio.timeout(timeout):
+                result = await self._execute(call, cancellation, confirm)
+        except (TimeoutError, DeadlineExceeded) as exc:
+            message = str(exc) or "Tool execution timed out."
             result = ToolResult(
                 status="timeout",
-                error=ToolErrorInfo(code="timeout", message=str(exc), retryable=True),
+                error=ToolErrorInfo(code="timeout", message=message, retryable=True),
             )
         except Exception as exc:
             result = ToolResult(
@@ -104,10 +102,14 @@ class ToolExecutor:
             duration_ms=max(0, round((self._clock() - started) * 1000)),
         )
         result = _limit_result(result, self.limits)
-        self.interaction.tool_finished(display_call, result)
         return result
 
-    def _execute(self, call: ToolCall) -> ToolResult:
+    async def _execute(
+        self,
+        call: ToolCall,
+        cancellation: CancellationToken,
+        confirm: ConfirmationHandler,
+    ) -> ToolResult:
         tool = self.registry.get(call.name)
         if tool is None:
             return _error("unknown_tool", f"Unknown tool '{call.name}'.", retryable=True)
@@ -129,17 +131,20 @@ class ToolExecutor:
             workspace=self.workspace,
             deadline=Deadline(self.ordinary_timeout_seconds, clock=self._clock),
             limits=self.limits,
+            cancellation=cancellation,
         )
         try:
-            action = tool.prepare(call.arguments, context)
+            action = await tool.prepare(call.arguments, context)
             context.deadline.check()
+            cancellation.raise_if_cancelled()
             if tool.requires_confirmation:
                 if action.preview is None:
                     return _error(
                         "missing_confirmation_preview",
                         "Tool requires confirmation but did not provide a preview.",
                     )
-                if not self.interaction.confirm(action.preview):
+                preview = self.sanitize_preview(action.preview)
+                if not await confirm(call, preview):
                     return ToolResult(
                         status="rejected",
                         error=ToolErrorInfo(
@@ -148,7 +153,8 @@ class ToolExecutor:
                             retryable=True,
                         ),
                     )
-            result = tool.execute(action, context)
+                cancellation.raise_if_cancelled()
+            result = await tool.execute(action, context)
             if not getattr(tool, "manages_own_timeout", False):
                 context.deadline.check()
             return result
@@ -249,28 +255,3 @@ def _limit_result(result: ToolResult, limits: ToolOutputLimits) -> ToolResult:
         for item in truncations
     ]
     return replace(result, data=data, truncation=truncations[0])
-
-
-@contextmanager
-def _hard_deadline(timeout_seconds: float | None):
-    if (
-        timeout_seconds is None
-        or timeout_seconds <= 0
-        or not hasattr(signal, "setitimer")
-        or threading.current_thread() is not threading.main_thread()
-    ):
-        yield
-        return
-
-    previous_handler = signal.getsignal(signal.SIGALRM)
-
-    def timeout_handler(signum, frame):
-        raise DeadlineExceeded()
-
-    signal.signal(signal.SIGALRM, timeout_handler)
-    previous_timer = signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
-        signal.signal(signal.SIGALRM, previous_handler)
