@@ -1,20 +1,29 @@
 import json
+import inspect
+from dataclasses import FrozenInstanceError
 
 import httpx
 import pytest
 
 from mewcode.config import LLMConfig
 from mewcode.errors import ProviderError
+from mewcode.messages import (
+    AssistantMessage,
+    ToolResultsMessage,
+    UserMessage,
+)
 from mewcode.providers import create_provider
 from mewcode.providers.anthropic import AnthropicProvider
 from mewcode.providers.base import (
-    AssistantMessage,
+    LLMProvider,
+    ProviderResponseCompleted,
+    ProviderTextDelta,
+    ProviderToolCallDelta,
     ResponseCompleted,
     TextDelta,
+    TokenUsage,
     ToolCallDelta,
     ToolFeedback,
-    ToolResultsMessage,
-    UserMessage,
 )
 from mewcode.providers.openai import OpenAIProvider
 from mewcode.tools.base import ToolDefinition, ToolResult
@@ -129,10 +138,37 @@ def collect_events(provider, history=(), tools=(), cancellation=None):
 def test_base_types_hide_provider_state():
     state = {"secret": "protocol state"}
     assistant = AssistantMessage("hello", state)
+    user = UserMessage("hello")
+    results = ToolResultsMessage((feedback(),))
     completed = ResponseCompleted(state)
 
     assert "protocol state" not in repr(assistant)
     assert "protocol state" not in repr(completed)
+    with pytest.raises(FrozenInstanceError):
+        user.content = "changed"
+    with pytest.raises(FrozenInstanceError):
+        assistant.content = "changed"
+    with pytest.raises(FrozenInstanceError):
+        results.results = ()
+
+
+def test_base_types_token_usage_and_protocol_are_async():
+    state = {"secret": "provider state"}
+    usage = TokenUsage(11, None, 19)
+    completed = ProviderResponseCompleted(state, usage)
+
+    assert ProviderTextDelta("hi").text == "hi"
+    assert ProviderToolCallDelta(2, name_delta="read_file").slot == 2
+    assert completed.usage == usage
+    assert TokenUsage(None, None, None).total_tokens is None
+    assert "provider state" not in repr(completed)
+    with pytest.raises(FrozenInstanceError):
+        usage.input_tokens = 0
+
+    signature = inspect.signature(LLMProvider.stream_response)
+    assert signature.parameters["instructions"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["cancellation"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert inspect.iscoroutinefunction(LLMProvider.aclose)
 
 
 def test_factory_creates_both_providers(openai_config, anthropic_config):

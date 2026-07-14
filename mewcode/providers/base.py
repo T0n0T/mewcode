@@ -1,28 +1,35 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
-from mewcode.tools.base import JSONValue, ToolDefinition, ToolResult
-from mewcode.turns import TurnCancellation
+from mewcode.cancellation import CancellationToken
+from mewcode.messages import (
+    AssistantMessage,
+    ConversationMessage,
+    ToolResultsMessage,
+    UserMessage,
+)
+from mewcode.tools.base import ToolCall, ToolDefinition, ToolFeedback
 
 ProviderProtocol = Literal["openai", "anthropic"]
 
 
 @dataclass(frozen=True)
-class UserMessage:
-    content: str
+class TokenUsage:
+    input_tokens: int | None
+    output_tokens: int | None
+    total_tokens: int | None
 
 
 @dataclass(frozen=True)
-class AssistantMessage:
-    content: str
-    provider_state: object = field(repr=False)
+class ProviderTextDelta:
+    text: str
 
 
 @dataclass(frozen=True)
-class ToolCallDelta:
+class ProviderToolCallDelta:
     slot: int
     call_id_delta: str = ""
     name_delta: str = ""
@@ -30,36 +37,19 @@ class ToolCallDelta:
 
 
 @dataclass(frozen=True)
-class ToolCall:
-    call_id: str
-    name: str
-    arguments: dict[str, JSONValue]
-
-
-@dataclass(frozen=True)
-class ToolFeedback:
-    call_id: str
-    name: str
-    result: ToolResult
-
-
-@dataclass(frozen=True)
-class ToolResultsMessage:
-    results: tuple[ToolFeedback, ...]
-
-
-@dataclass(frozen=True)
-class TextDelta:
-    text: str
-
-
-@dataclass(frozen=True)
-class ResponseCompleted:
+class ProviderResponseCompleted:
     provider_state: object = field(repr=False)
+    usage: TokenUsage = TokenUsage(None, None, None)
 
 
-ConversationMessage = UserMessage | AssistantMessage | ToolResultsMessage
-ProviderEvent = TextDelta | ToolCallDelta | ResponseCompleted
+# Temporary migration aliases for the synchronous providers. They are removed
+# when both concrete adapters move to the asynchronous contract.
+TextDelta = ProviderTextDelta
+ToolCallDelta = ProviderToolCallDelta
+ResponseCompleted = ProviderResponseCompleted
+
+
+ProviderEvent = ProviderTextDelta | ProviderToolCallDelta | ProviderResponseCompleted
 
 
 class LLMProvider(Protocol):
@@ -67,6 +57,11 @@ class LLMProvider(Protocol):
         self,
         history: Sequence[ConversationMessage],
         tools: Sequence[ToolDefinition],
-        cancellation: TurnCancellation,
-    ) -> Iterator[ProviderEvent]:
+        *,
+        instructions: str,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[ProviderEvent]:
         """Yield unified provider events for the given conversation."""
+
+    async def aclose(self) -> None:
+        """Release resources owned by the provider."""

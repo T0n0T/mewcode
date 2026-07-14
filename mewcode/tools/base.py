@@ -3,8 +3,10 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias
 
+from mewcode.cancellation import CancellationToken
 from mewcode.errors import DeadlineExceeded
 
 if TYPE_CHECKING:
@@ -14,7 +16,18 @@ JSONValue: TypeAlias = (
     None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
 )
 ToolStatus = Literal["success", "error", "rejected", "timeout"]
+ToolScope: TypeAlias = Literal["all", "read_only"]
 TruncationUnit = Literal["characters", "bytes", "paths", "matches"]
+
+
+class ToolAccess(str, Enum):
+    READ_ONLY = "read_only"
+    MUTATING = "mutating"
+
+
+class ToolExecutionPolicy(str, Enum):
+    PARALLEL_SAFE = "parallel_safe"
+    SERIAL = "serial"
 
 
 @dataclass(frozen=True)
@@ -22,6 +35,13 @@ class ToolDefinition:
     name: str
     description: str
     input_schema: dict[str, JSONValue]
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    call_id: str
+    name: str
+    arguments: dict[str, JSONValue]
 
 
 @dataclass(frozen=True)
@@ -73,6 +93,27 @@ class ToolResult:
 
 
 @dataclass(frozen=True)
+class ToolFeedback:
+    call_id: str
+    name: str
+    result: ToolResult
+
+
+@dataclass(frozen=True)
+class ToolDescriptor:
+    definition: ToolDefinition
+    access: ToolAccess
+    execution_policy: ToolExecutionPolicy
+    requires_confirmation: bool
+
+
+@dataclass(frozen=True)
+class ToolPresentation:
+    name: str
+    argument_summary: str
+
+
+@dataclass(frozen=True)
 class ConfirmationPreview:
     kind: Literal["command", "write", "edit"]
     title: str
@@ -119,19 +160,23 @@ class ToolContext:
     workspace: "Workspace"
     deadline: Deadline
     limits: ToolOutputLimits
+    cancellation: CancellationToken
 
 
 class Tool(Protocol):
     definition: ToolDefinition
+    access: ToolAccess
+    execution_policy: ToolExecutionPolicy
     requires_confirmation: bool
+    manages_own_timeout: bool
 
-    def prepare(
+    async def prepare(
         self,
         arguments: Mapping[str, JSONValue],
         context: ToolContext,
     ) -> PreparedToolAction: ...
 
-    def execute(
+    async def execute(
         self,
         action: PreparedToolAction,
         context: ToolContext,
