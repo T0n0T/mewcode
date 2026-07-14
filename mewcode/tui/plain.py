@@ -8,6 +8,7 @@ from mewcode.errors import MewCodeError, redact_secrets
 from mewcode.providers.base import ToolCall
 from mewcode.runtime import ChatRuntime
 from mewcode.tools.base import ConfirmationPreview, JSONValue, ToolResult
+from mewcode.tui.events import DEFAULT_ERROR_SUGGESTION
 from mewcode.tui.mode import supports_unicode
 from mewcode.turns import (
     TurnCancellation,
@@ -140,6 +141,7 @@ class PlainChatApp:
                 if response_started:
                     self._write("\n")
                 self._write(f"ERROR: {exc.user_message}\n")
+                self._write(f"NEXT: {DEFAULT_ERROR_SUGGESTION}\n")
 
     def _write(self, text: str) -> None:
         self.output_stream.write(text)

@@ -17,9 +17,11 @@ from mewcode.runtime import ChatRuntime
 from mewcode.tui.events import (
     ActivityState,
     ConfirmationRequestedMessage,
+    INTERNAL_ERROR_SUGGESTION,
     ToolBudgetMessage,
     ToolFinishedMessage,
     ToolStartedMessage,
+    TOOL_BUDGET_SUGGESTION,
     TurnCompletedMessage,
     TurnErrorMessage,
     TurnErrorPayload,
@@ -214,6 +216,7 @@ class CyberpunkChatApp(App[int]):
                         generation_id,
                         "Internal turn worker failure.",
                         type(exc).__name__,
+                        INTERNAL_ERROR_SUGGESTION,
                     )
                 )
             )
@@ -333,12 +336,13 @@ class CyberpunkChatApp(App[int]):
         card = ToolCard(payload, unicode=self.unicode_output)
         self._tool_cards[payload.call_id] = card
         await self.query_one(ConversationView).append_widget(card)
-        self._set_activity(ActivityState.EXECUTING, payload.name)
+        await self._show_activity(ActivityState.EXECUTING, payload.name)
 
-    def on_tool_finished_message(self, message: ToolFinishedMessage) -> None:
+    async def on_tool_finished_message(self, message: ToolFinishedMessage) -> None:
         payload = message.payload
         if not self._is_current(payload.generation_id):
             return
+        await self._remove_activity()
         card = self._tool_cards.get(payload.call_id)
         if card is not None:
             card.finish(payload)
@@ -353,6 +357,7 @@ class CyberpunkChatApp(App[int]):
                 TurnErrorPayload(
                     payload.generation_id,
                     "Tool limit reached for this turn.",
+                    suggestion=TOOL_BUDGET_SUGGESTION,
                 ),
                 unicode=self.unicode_output,
             )
@@ -434,19 +439,20 @@ class CyberpunkChatApp(App[int]):
         self._apply_size_classes(event.size.width, event.size.height)
 
     def _apply_size_classes(self, width: int, height: int) -> None:
-        was_too_small = self.screen.has_class("too-small")
+        screen = self.screen_stack[0] if self.screen_stack else self.screen
+        was_too_small = screen.has_class("too-small")
         for class_name in ("wide", "compact", "narrow", "too-small"):
-            self.screen.remove_class(class_name)
+            screen.remove_class(class_name)
         is_too_small = width < 48 or height < 14
         if is_too_small:
-            self.screen.add_class("too-small")
+            screen.add_class("too-small")
         elif width >= 100:
-            self.screen.add_class("wide")
+            screen.add_class("wide")
         elif width >= 72:
-            self.screen.add_class("compact")
+            screen.add_class("compact")
         else:
-            self.screen.add_class("narrow")
-        if was_too_small and not is_too_small and len(self.screen_stack) == 1:
+            screen.add_class("narrow")
+        if was_too_small and not is_too_small and self.screen is screen:
             self.call_after_refresh(self.query_one(PromptComposer).focus)
 
     async def _show_activity(

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 from textual.app import App, ComposeResult
-from textual.widgets import Markdown, Static
+from textual.widgets import Collapsible, Markdown, Static
 
 from mewcode.tools.base import ConfirmationPreview
 from mewcode.tui.events import (
@@ -236,6 +236,28 @@ async def test_composer_busy_state_preserves_draft_and_suppresses_submit():
 
 
 @pytest.mark.asyncio
+async def test_composer_grows_for_soft_wrapped_text():
+    app = ComposerApp()
+
+    async with app.run_test(size=(50, 12)) as pilot:
+        composer = app.query_one(PromptComposer)
+        composer.focus()
+        composer.insert("wrapped text " * 12)
+        await pilot.pause()
+
+        assert 1 < composer.styles.height.value <= 6
+        initial_height = composer.styles.height.value
+
+        await pilot.resize_terminal(24, 12)
+        await pilot.pause()
+        assert initial_height <= composer.styles.height.value <= 6
+
+        await pilot.resize_terminal(80, 12)
+        await pilot.pause()
+        assert composer.styles.height.value < initial_height
+
+
+@pytest.mark.asyncio
 async def test_composer_navigates_history_only_from_empty_or_history_state():
     app = ComposerApp()
 
@@ -345,6 +367,25 @@ async def test_frozen_conversation_stays_frozen_across_resize():
         assert conversation.unread_output == 1
 
 
+@pytest.mark.asyncio
+async def test_moving_away_from_bottom_freezes_following():
+    app = ScrollApp()
+
+    async with app.run_test(size=(40, 8)) as pilot:
+        conversation = app.query_one(ConversationView)
+        for index in range(30):
+            await conversation.append_widget(Static(f"line {index}"))
+        await pilot.pause()
+        assert conversation.follow_output is True
+        assert conversation.scroll_y == conversation.max_scroll_y
+        assert conversation.vertical_scrollbar.position == conversation.scroll_y
+
+        conversation.scroll_y = 0
+        await pilot.pause()
+
+        assert conversation.follow_output is False
+
+
 class CardsApp(App[None]):
     def compose(self) -> ComposeResult:
         yield ToolCard(
@@ -388,8 +429,14 @@ async def test_tool_card_updates_in_place_and_error_details_stay_collapsed():
         )
         assert "ERROR read_file · 9ms" in str(card.title)
         assert "status-error" in card.classes
-        assert app.query_one(ErrorCard).collapsed is True
-        assert "Network unavailable" in str(app.query_one(ErrorCard).title)
+        assert "correct the tool input" in card._details.render().plain
+        error = app.query_one(ErrorCard)
+        assert error.collapsed is True
+        assert "Network unavailable" in str(error.title)
+        assert "Retry" in error.query_one(
+            ".error-suggestion", Static
+        ).render().plain
+        assert error.query_one(".error-technical", Collapsible).collapsed is True
 
 
 class ModalApp(App[None]):

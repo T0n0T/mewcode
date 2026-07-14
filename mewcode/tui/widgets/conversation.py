@@ -65,6 +65,7 @@ class ConversationView(VerticalScroll):
         super().__init__(*children, id="conversation", can_focus=True)
         self.follow_output = True
         self.unread_output = 0
+        self._scrolling_to_latest = False
 
     async def append_widget(self, widget: Widget) -> None:
         await self.mount(widget)
@@ -72,7 +73,7 @@ class ConversationView(VerticalScroll):
 
     def note_output(self) -> None:
         if self.follow_output:
-            self.scroll_end(animate=False, immediate=True)
+            self.call_after_refresh(self._scroll_to_latest)
             return
         self.unread_output += 1
         self.post_message(self.UnreadChanged(self.unread_output))
@@ -83,14 +84,31 @@ class ConversationView(VerticalScroll):
     def return_to_bottom(self) -> None:
         self.follow_output = True
         self.unread_output = 0
-        self.scroll_end(animate=False, immediate=True)
+        self._scroll_to_latest()
         self.post_message(self.UnreadChanged(0))
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        if (
+            self.follow_output
+            and not self._scrolling_to_latest
+            and new_value < self.max_scroll_y
+        ):
+            self.freeze_following()
+
+    def _scroll_to_latest(self) -> None:
+        if self.follow_output:
+            self._scrolling_to_latest = True
+            try:
+                self.scroll_end(animate=False, immediate=True)
+            finally:
+                self._scrolling_to_latest = False
 
     def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
         self.freeze_following()
 
     def on_key(self, event: events.Key) -> None:
-        if event.key in {"pageup", "up"}:
+        if event.key in {"pageup", "up", "home"}:
             self.freeze_following()
         elif event.key == "end":
             event.stop()
@@ -136,6 +154,13 @@ class ToolCard(Collapsible):
             details.append(f"hint: {payload.truncation.hint}")
         if not details:
             details.append("Result metadata only; full output was sent to the model.")
+        next_step = {
+            "error": "Review the error, correct the tool input, and try again.",
+            "timeout": "Narrow the operation before trying the tool again.",
+            "rejected": "Approve explicitly if you want this operation to run.",
+        }.get(payload.status)
+        if next_step is not None:
+            details.append(f"NEXT: {next_step}")
         self._details.update("\n".join(details))
         self.remove_class("status-error", "status-warning", "status-success")
         status_class = {
@@ -147,18 +172,33 @@ class ToolCard(Collapsible):
         self.add_class(status_class)
 
 
-class ErrorCard(Collapsible):
+class ErrorCard(Vertical):
     def __init__(self, payload: TurnErrorPayload, *, unicode: bool = True) -> None:
         details = payload.technical_detail or "No additional technical details."
         separator = " · " if unicode else " - "
-        super().__init__(
+        self.title = f"ERROR{separator}{payload.message}"
+        self._technical = Collapsible(
             Static(details, markup=False),
-            title=f"ERROR{separator}{payload.message}",
+            title="Technical details",
             collapsed=True,
             collapsed_symbol="▶" if unicode else ">",
             expanded_symbol="▼" if unicode else "v",
+            classes="error-technical",
+        )
+        super().__init__(
+            Static(self.title, classes="error-title", markup=False),
+            Static(
+                f"NEXT: {payload.suggestion}",
+                classes="error-suggestion",
+                markup=False,
+            ),
+            self._technical,
             classes="card error-card status-error",
         )
+
+    @property
+    def collapsed(self) -> bool:
+        return self._technical.collapsed
 
 
 def _started_details(payload: ToolStartedPayload) -> str:

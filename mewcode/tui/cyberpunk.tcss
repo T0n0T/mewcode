@@ -42,6 +42,12 @@ Screen {
     text-style: bold;
 }
 
+#session-header > #header-model {
+    max-width: 28;
+    overflow-x: hidden;
+    text-overflow: ellipsis;
+}
+
 #header-workspace,
 #header-branch {
     color: $muted;
@@ -124,6 +130,23 @@ Screen {
 
 .error-card {
     border-left: tall $error;
+}
+
+.error-title {
+    width: 100%;
+    height: auto;
+    text-style: bold;
+}
+
+.error-suggestion {
+    width: 100%;
+    height: auto;
+    color: $text;
+}
+
+.error-technical {
+    width: 100%;
+    height: auto;
 }
 
 .activity {

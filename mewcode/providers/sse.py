@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +12,11 @@ from mewcode.errors import ProviderError
 class SSEEvent:
     event: str | None
     data: dict[str, Any]
+
+
+def stream_closer(response: Any) -> Callable[[], None]:
+    closer = getattr(response, "close", None)
+    return closer if callable(closer) else lambda: None
 
 
 def iter_sse_events(response: Any) -> Iterator[SSEEvent]:

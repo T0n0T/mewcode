@@ -9,6 +9,16 @@ from textual.message import Message
 from mewcode.tools.base import ConfirmationPreview, ToolStatus
 from mewcode.turns import TurnPhase
 
+DEFAULT_ERROR_SUGGESTION = (
+    "Retry the request. If it fails again, check network access and provider settings."
+)
+INTERNAL_ERROR_SUGGESTION = (
+    "Retry once. If it recurs, restart MewCode and report the error type."
+)
+TOOL_BUDGET_SUGGESTION = (
+    "Start a new turn or ask for a final answer without another tool."
+)
+
 
 class ActivityState(str, Enum):
     READY = "ready"
@@ -42,6 +52,7 @@ class TurnErrorPayload:
     generation_id: int
     message: str
     technical_detail: str | None = None
+    suggestion: str = DEFAULT_ERROR_SUGGESTION
 
 
 @dataclass(frozen=True)

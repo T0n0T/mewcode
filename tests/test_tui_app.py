@@ -384,11 +384,34 @@ async def test_confirmation_modal_rejects_and_unblocks_tool_worker(tmp_path):
         app.query_one(PromptComposer).load_text("confirm")
         await pilot.press("enter")
         await wait_for(pilot, lambda: isinstance(app.screen, ConfirmationModal))
+        executing = app.screen_stack[0].query_one(ActivityIndicator)
+        assert "EXECUTING read_file" in executing.render().plain
         await pilot.press("escape")
         await wait_for(pilot, lambda: app.activity_state is ActivityState.READY)
 
         assert runtime.approved is False
         assert "REJECTED" in str(app.query_one(ToolCard).title)
+
+
+@pytest.mark.asyncio
+async def test_resize_during_confirmation_updates_underlying_layout(tmp_path):
+    bridge = TuiEventBridge()
+    runtime = ToolRuntime(TuiToolInteraction(bridge), confirm=True)
+    app = CyberpunkChatApp(runtime, metadata(tmp_path), bridge)  # type: ignore[arg-type]
+
+    async with app.run_test(size=(120, 36)) as pilot:
+        app.query_one(PromptComposer).load_text("confirm")
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: isinstance(app.screen, ConfirmationModal))
+        assert "wide" in app.screen_stack[0].classes
+
+        await pilot.resize_terminal(60, 18)
+        assert "narrow" in app.screen_stack[0].classes
+        await pilot.press("escape")
+        await wait_for(pilot, lambda: app.activity_state is ActivityState.READY)
+
+        assert "narrow" in app.screen.classes
+        assert app.query_one(PromptComposer).has_focus is True
 
 
 class FailingRuntime:
@@ -439,6 +462,9 @@ async def test_unexpected_error_is_sanitized_and_restores_ready(tmp_path):
         card = app.query_one(ErrorCard)
         assert "Internal turn worker failure." in str(card.title)
         assert "internal implementation detail" not in str(card.render())
+        assert "restart MewCode" in card.query_one(
+            ".error-suggestion", Static
+        ).render().plain
         assert app.activity_state is ActivityState.READY
         assert app.query_one(PromptComposer).busy is False
 
@@ -875,6 +901,29 @@ async def test_compact_header_keeps_status_visible_with_long_workspace():
         assert status.render().plain == "READY"
         assert status.region.width >= len("READY")
         assert status.region.right <= app.size.width
+
+
+@pytest.mark.asyncio
+async def test_narrow_header_truncates_long_model_before_status():
+    app = CyberpunkChatApp(
+        None,  # type: ignore[arg-type]
+        SessionMetadata(
+            "test",
+            "openai",
+            "model-with-an-extremely-long-version-and-variant-name",
+            Path("/workspace/mewcode"),
+            "main",
+        ),
+        TuiEventBridge(),
+    )
+
+    async with app.run_test(size=(60, 18)) as pilot:
+        await pilot.pause()
+        model = app.query_one("#header-model", Static)
+        status = app.query_one("#connection-status", Static)
+
+        assert status.region.width >= len("READY")
+        assert model.region.right <= status.region.x
 
 
 def test_snapshot_wide_welcome(snap_compare, monkeypatch):

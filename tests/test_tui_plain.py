@@ -120,6 +120,7 @@ def test_plain_app_reports_error_and_continues():
 
     assert app.run() == 0
     assert "ERROR: temporary failure" in output.getvalue()
+    assert "Retry" in output.getvalue()
     assert "Bye." in output.getvalue()
 
 

@@ -69,6 +69,13 @@ class WelcomeCard(Static):
 class ActivityIndicator(Static):
     _UNICODE_SPINNER = ("◆", "◇", "◈", "◇")
     _ASCII_SPINNER = ("|", "/", "-", "\\")
+    _ANIMATED_STATES = frozenset(
+        {
+            ActivityState.UPLINKING,
+            ActivityState.EXECUTING,
+            ActivityState.SYNTHESIZING,
+        }
+    )
     _LABELS = {
         ActivityState.READY: "READY",
         ActivityState.UPLINKING: "UPLINKING",
@@ -111,22 +118,14 @@ class ActivityIndicator(Static):
         self._refresh_content()
 
     def _tick(self) -> None:
-        if self.state in {
-            ActivityState.UPLINKING,
-            ActivityState.EXECUTING,
-            ActivityState.SYNTHESIZING,
-        }:
+        if self.state in self._ANIMATED_STATES:
             self._frame += 1
             self._refresh_content()
 
     def _refresh_content(self) -> None:
         label = self._LABELS[self.state]
         detail = f" {self.detail}" if self.detail else ""
-        if self.state in {
-            ActivityState.UPLINKING,
-            ActivityState.EXECUTING,
-            ActivityState.SYNTHESIZING,
-        }:
+        if self.state in self._ANIMATED_STATES:
             elapsed = max(0.0, self._clock() - self._started_at)
             marker = self._spinner[self._frame % len(self._spinner)]
             self.update(

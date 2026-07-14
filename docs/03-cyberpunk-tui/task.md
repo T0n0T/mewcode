@@ -46,7 +46,7 @@
 | 新建 | `tests/test_tui_widgets.py` | Widget、Markdown、滚动和响应式行为 |
 | 新建 | `tests/test_tui_interaction.py` | 工具卡、确认和脱敏 |
 | 新建 | `tests/test_tui_metadata.py` | 会话元数据降级 |
-| 新建 | `tests/snapshots/` | 少量关键终端布局快照 |
+| 新建 | `tests/__snapshots__/` | 少量关键终端布局快照 |
 
 ## T1：加入 TUI 依赖
 
@@ -650,7 +650,7 @@
 
 ## T38：加入关键布局快照
 
-**文件：** `tests/test_tui_app.py`、`tests/snapshots/`
+**文件：** `tests/test_tui_app.py`、`tests/__snapshots__/`
 **依赖：** T33、T34、T37
 
 **步骤：**

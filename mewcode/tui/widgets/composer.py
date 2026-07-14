@@ -117,6 +117,9 @@ class PromptComposer(TextArea):
         if event.text_area is self:
             self._sync_height()
 
+    def on_resize(self, event: events.Resize) -> None:
+        self.call_after_refresh(self._sync_height)
+
     def _load_history(self, text: str) -> None:
         self.load_text(text)
         lines = text.split("\n")
@@ -124,5 +127,10 @@ class PromptComposer(TextArea):
         self._sync_height()
 
     def _sync_height(self) -> None:
-        line_count = min(6, max(1, self.text.count("\n") + 1))
+        visual_lines = (
+            self.wrapped_document.height
+            if self.soft_wrap and self.wrap_width
+            else self.text.count("\n") + 1
+        )
+        line_count = min(6, max(1, visual_lines))
         self.styles.height = line_count

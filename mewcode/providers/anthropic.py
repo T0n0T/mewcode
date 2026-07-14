@@ -19,7 +19,7 @@ from mewcode.providers.base import (
     ToolResultsMessage,
     UserMessage,
 )
-from mewcode.providers.sse import iter_sse_events
+from mewcode.providers.sse import iter_sse_events, stream_closer
 from mewcode.tools.base import ToolDefinition
 from mewcode.turns import TurnCancellation, TurnInterrupted
 
@@ -63,7 +63,7 @@ class AnthropicProvider:
 
         try:
             with self._stream("POST", url, headers=headers, json=body) as response:
-                with cancellation.bind_stream_closer(_stream_closer(response)):
+                with cancellation.bind_stream_closer(stream_closer(response)):
                     cancellation.raise_if_cancelled()
                     self._raise_for_status(response)
                     for event in iter_sse_events(response):
@@ -230,8 +230,3 @@ def _response_text(response: Any) -> str:
         return str(getattr(response, "text", ""))
     except Exception:
         return ""
-
-
-def _stream_closer(response: Any) -> Any:
-    closer = getattr(response, "close", None)
-    return closer if callable(closer) else lambda: None
