@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import heapq
 import os
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from pathlib import Path, PurePath
 
 import pathspec
 
+from mewcode.cancellation import CancellationToken
 from mewcode.errors import WorkspacePathError
 from mewcode.tools.base import Deadline
 
@@ -80,25 +83,52 @@ class Workspace:
         candidate = f"{normalized}/" if is_dir else normalized
         return self._ignore_spec.match_file(candidate)
 
-    def walk_files(self, deadline: Deadline) -> Iterator[Path]:
-        found: list[Path] = []
-        for current, directories, files in os.walk(self.root, followlinks=False):
+    def _read_directory(self, directory: Path) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+        directories: list[Path] = []
+        files: list[Path] = []
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    relative = self.relative(path)
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            if not self.is_ignored(relative, is_dir=True):
+                                directories.append(path)
+                        elif entry.is_file(follow_symlinks=False) and not self.is_ignored(
+                            relative
+                        ):
+                            files.append(path)
+                    except OSError:
+                        continue
+        except OSError:
+            return (), ()
+
+        return (
+            tuple(sorted(directories, key=self.relative)),
+            tuple(sorted(files, key=self.relative)),
+        )
+
+    async def walk_files(
+        self,
+        deadline: Deadline,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[Path]:
+        pending: list[tuple[str, bool, Path]] = [("", True, self.root)]
+        while pending:
+            cancellation.raise_if_cancelled()
             deadline.check()
-            current_path = Path(current)
-            kept_directories: list[str] = []
-            for directory in sorted(directories):
-                path = current_path / directory
-                relative = self.relative(path)
-                if path.is_symlink() or self.is_ignored(relative, is_dir=True):
-                    continue
-                kept_directories.append(directory)
-            directories[:] = kept_directories
-            for filename in sorted(files):
-                deadline.check()
-                path = current_path / filename
-                relative = self.relative(path)
-                if path.is_symlink() or self.is_ignored(relative):
-                    continue
-                if path.is_file():
-                    found.append(path)
-        yield from sorted(found, key=self.relative)
+            _, is_directory, path = heapq.heappop(pending)
+            if not is_directory:
+                yield path
+                continue
+
+            directories, files = await asyncio.to_thread(self._read_directory, path)
+            cancellation.raise_if_cancelled()
+            deadline.check()
+            for child in directories:
+                heapq.heappush(pending, (f"{self.relative(child)}/", True, child))
+            for child in files:
+                heapq.heappush(pending, (self.relative(child), False, child))
