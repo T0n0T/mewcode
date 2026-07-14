@@ -829,6 +829,8 @@ class ToolScheduler:
         self,
         registry: ToolRegistry,
         executor: ToolExecutor,
+        *,
+        id_factory: Callable[[], str] | None = None,
     ) -> None: ...
 
     def parse_calls(

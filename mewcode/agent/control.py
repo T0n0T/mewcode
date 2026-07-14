@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
-from typing import cast
 
 from mewcode.agent.events import AgentEvent, EventContext, RunStopped
-
-_CLOSED = object()
 
 
 class EventChannel:
@@ -21,7 +18,8 @@ class EventChannel:
         if capacity < 1:
             raise ValueError("Event channel capacity must be at least 1.")
         self.run_id = run_id
-        self._queue: asyncio.Queue[AgentEvent | object] = asyncio.Queue(capacity)
+        self._queue: asyncio.Queue[AgentEvent] = asyncio.Queue(capacity + 1)
+        self._ordinary_slots = asyncio.Semaphore(capacity)
         self._lock = asyncio.Lock()
         self._sequence = 0
         self._terminal = False
@@ -29,20 +27,31 @@ class EventChannel:
         self._on_consumer_close = on_consumer_close
 
     async def publish(self, event: AgentEvent) -> bool:
-        async with self._lock:
-            if self._terminal:
-                return False
-            self._sequence += 1
-            contextualized = replace(
-                event,
-                context=replace(
-                    event.context,
-                    run_id=self.run_id,
-                    sequence=self._sequence,
-                ),
-            )
-            await self._queue.put(contextualized)
-            return True
+        if isinstance(event, RunStopped):
+            return await self.stop(event)
+        if self._terminal:
+            return False
+        await self._ordinary_slots.acquire()
+        enqueued = False
+        try:
+            async with self._lock:
+                if self._terminal:
+                    return False
+                self._sequence += 1
+                contextualized = replace(
+                    event,
+                    context=replace(
+                        event.context,
+                        run_id=self.run_id,
+                        sequence=self._sequence,
+                    ),
+                )
+                self._queue.put_nowait(contextualized)
+                enqueued = True
+                return True
+        finally:
+            if not enqueued:
+                self._ordinary_slots.release()
 
     async def stop(self, event: RunStopped) -> bool:
         async with self._lock:
@@ -58,34 +67,52 @@ class EventChannel:
                     sequence=self._sequence,
                 ),
             )
-            await self._queue.put(contextualized)
-            await self._queue.put(_CLOSED)
+            self._queue.put_nowait(contextualized)
             return True
 
     async def get(self) -> AgentEvent:
-        item = await self._queue.get()
-        if item is _CLOSED:
-            raise StopAsyncIteration
-        return cast(AgentEvent, item)
+        event = await self._queue.get()
+        if not isinstance(event, RunStopped):
+            self._ordinary_slots.release()
+        return event
 
-    def events(self) -> AsyncGenerator[AgentEvent, None]:
+    def events(self) -> _EventStream:
         if self._consumer_claimed:
             raise RuntimeError("An AgentRun permits only one consumer.")
         self._consumer_claimed = True
-        return self._iterate()
+        return _EventStream(self)
 
-    async def _iterate(self) -> AsyncGenerator[AgentEvent, None]:
-        exhausted = False
+
+class _EventStream(AsyncIterator[AgentEvent]):
+    def __init__(self, channel: EventChannel) -> None:
+        self._channel = channel
+        self._closed = False
+        self._terminal_seen = False
+        self._close_lock = asyncio.Lock()
+
+    def __aiter__(self) -> _EventStream:
+        return self
+
+    async def __anext__(self) -> AgentEvent:
+        if self._closed or self._terminal_seen:
+            self._closed = True
+            raise StopAsyncIteration
         try:
-            while True:
-                item = await self._queue.get()
-                if item is _CLOSED:
-                    exhausted = True
-                    return
-                yield cast(AgentEvent, item)
-        finally:
-            if not exhausted and self._on_consumer_close is not None:
-                await self._on_consumer_close()
+            event = await self._channel.get()
+        except asyncio.CancelledError:
+            await self.aclose()
+            raise
+        if isinstance(event, RunStopped):
+            self._terminal_seen = True
+        return event
+
+    async def aclose(self) -> None:
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if not self._terminal_seen and self._channel._on_consumer_close is not None:
+                await self._channel._on_consumer_close()
 
 
 class ConfirmationBroker:

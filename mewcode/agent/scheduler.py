@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
+from uuid import uuid4
 
 from mewcode.agent.collector import RawToolCall
 from mewcode.cancellation import CancellationToken
@@ -53,9 +54,16 @@ class ToolRunEvents(Protocol):
 
 
 class ToolScheduler:
-    def __init__(self, registry: ToolRegistry, executor: ToolExecutor) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        executor: ToolExecutor,
+        *,
+        id_factory: Callable[[], str] | None = None,
+    ) -> None:
         self._registry = registry
         self._executor = executor
+        self._id_factory = id_factory or _new_id
 
     def parse_calls(
         self, calls: Sequence[RawToolCall]
@@ -99,7 +107,7 @@ class ToolScheduler:
             if parallel:
                 batches.append(
                     ToolBatch(
-                        f"batch-{len(batches) + 1}",
+                        self._id_factory(),
                         ToolExecutionPolicy.PARALLEL_SAFE,
                         tuple(parallel),
                     )
@@ -113,7 +121,7 @@ class ToolScheduler:
                 flush_parallel()
                 batches.append(
                     ToolBatch(
-                        f"batch-{len(batches) + 1}",
+                        self._id_factory(),
                         ToolExecutionPolicy.SERIAL,
                         (call,),
                     )
@@ -181,3 +189,7 @@ def _error(code: str, message: str) -> ToolResult:
         status="error",
         error=ToolErrorInfo(code, message, True),
     )
+
+
+def _new_id() -> str:
+    return str(uuid4())

@@ -70,11 +70,15 @@ class RecordingEvents:
         self.records.append(("finished", call.name))
 
 
-def scheduler(tmp_path: Path, tools):
+def scheduler(tmp_path: Path, tools, *, id_factory=None):
     registry = ToolRegistry()
     for tool in tools:
         registry.register(tool)
-    return ToolScheduler(registry, ToolExecutor(registry, Workspace(tmp_path)))
+    return ToolScheduler(
+        registry,
+        ToolExecutor(registry, Workspace(tmp_path)),
+        id_factory=id_factory,
+    )
 
 
 def raw(slot, name, arguments="{}", call_id=None):
@@ -155,6 +159,24 @@ def test_build_batches_preserves_parallel_groups_and_serial_barriers(tmp_path: P
         ToolExecutionPolicy.SERIAL,
         ToolExecutionPolicy.PARALLEL_SAFE,
     ]
+
+
+def test_batch_ids_use_injected_factory_and_remain_unique_across_builds(
+    tmp_path: Path,
+):
+    ids = iter(["batch-a", "batch-b"])
+    service = scheduler(
+        tmp_path,
+        [FakeTool("read", ToolExecutionPolicy.PARALLEL_SAFE)],
+        id_factory=lambda: next(ids),
+    )
+    scheduled = service.parse_calls([raw(0, "read")])
+
+    first = service.build_batches(scheduled)
+    second = service.build_batches(scheduled)
+
+    assert first[0].batch_id == "batch-a"
+    assert second[0].batch_id == "batch-b"
 
 
 @pytest.mark.asyncio

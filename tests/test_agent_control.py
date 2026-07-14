@@ -62,6 +62,48 @@ async def test_event_queue_applies_backpressure_at_capacity():
 
 
 @pytest.mark.asyncio
+async def test_terminal_event_uses_reserved_capacity_when_queue_is_full():
+    channel = EventChannel("run", capacity=1)
+    await channel.publish(text_event("queued"))
+    terminal = RunStopped(EventContext("run", 0, 1), StopReason.CANCELLED, "cancelled")
+
+    stopping = asyncio.create_task(channel.stop(terminal))
+    await asyncio.sleep(0)
+    completed_without_drain = stopping.done()
+    if not completed_without_drain:
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+
+    assert completed_without_drain
+    assert stopping.result() is True
+    queued = await channel.get()
+    assert isinstance(queued, TextDeltaEvent)
+    observed = await anext(channel.events())
+    assert isinstance(observed, RunStopped)
+
+
+@pytest.mark.asyncio
+async def test_late_publish_is_rejected_immediately_when_queue_remains_full():
+    channel = EventChannel("run", capacity=1)
+    await channel.publish(text_event("queued"))
+    await channel.stop(
+        RunStopped(EventContext("run", 0, 1), StopReason.CANCELLED, "cancelled")
+    )
+
+    late = asyncio.create_task(channel.publish(text_event("late")))
+    await asyncio.sleep(0)
+    completed_without_drain = late.done()
+    if not completed_without_drain:
+        late.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await late
+
+    assert completed_without_drain
+    assert late.result() is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "reason",
     [StopReason.COMPLETED, StopReason.CANCELLED, StopReason.PROVIDER_ERROR],
@@ -79,6 +121,24 @@ async def test_single_consumer_unique_terminal_and_late_events_are_ignored(reaso
     observed = await anext(events)
     assert isinstance(observed, RunStopped)
     assert observed.reason is reason
+    with pytest.raises(StopAsyncIteration):
+        await anext(events)
+
+
+@pytest.mark.asyncio
+async def test_publishing_run_stopped_closes_channel_and_rejects_late_events():
+    channel = EventChannel("run")
+    events = channel.events()
+    terminal = RunStopped(
+        EventContext("run", 0, 1), StopReason.INTERNAL_ERROR, "failed"
+    )
+
+    assert await channel.publish(terminal) is True
+    assert await channel.publish(terminal) is False
+    assert await channel.publish(text_event("late")) is False
+    observed = await anext(events)
+    assert isinstance(observed, RunStopped)
+    assert observed.reason is StopReason.INTERNAL_ERROR
     with pytest.raises(StopAsyncIteration):
         await anext(events)
 
@@ -136,3 +196,17 @@ async def test_consumer_close_invokes_cancel_callback_once_and_cleans_confirmati
     assert calls == 1
     with pytest.raises(asyncio.CancelledError):
         await decision
+
+
+@pytest.mark.asyncio
+async def test_consumer_aclose_before_iteration_still_runs_cleanup():
+    calls = 0
+
+    async def cancel():
+        nonlocal calls
+        calls += 1
+
+    events = EventChannel("run", on_consumer_close=cancel).events()
+    await events.aclose()
+
+    assert calls == 1
