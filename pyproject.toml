@@ -9,11 +9,14 @@ dependencies = [
     "jsonschema>=4.26.0",
     "pathspec>=1.1.1",
     "PyYAML>=6.0",
+    "textual>=8.2.8",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=1.4.0",
+    "pytest-textual-snapshot>=1.0.0",
 ]
 
 [project.scripts]
