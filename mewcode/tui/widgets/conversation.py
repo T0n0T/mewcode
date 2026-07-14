@@ -4,6 +4,7 @@ from textual import events
 from textual.app import ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.message import Message
+from textual.widget import Widget
 from textual.widgets import Collapsible, Markdown, Static
 
 from mewcode.tui.events import (
@@ -60,12 +61,12 @@ class ConversationView(VerticalScroll):
             super().__init__()
             self.count = count
 
-    def __init__(self) -> None:
-        super().__init__(id="conversation", can_focus=True)
+    def __init__(self, *children: Widget) -> None:
+        super().__init__(*children, id="conversation", can_focus=True)
         self.follow_output = True
         self.unread_output = 0
 
-    async def append_widget(self, widget: Static | Vertical | Collapsible) -> None:
+    async def append_widget(self, widget: Widget) -> None:
         await self.mount(widget)
         self.note_output()
 
@@ -98,9 +99,10 @@ class ConversationView(VerticalScroll):
 
 
 class ToolCard(Collapsible):
-    def __init__(self, payload: ToolStartedPayload) -> None:
+    def __init__(self, payload: ToolStartedPayload, *, unicode: bool = True) -> None:
         self.call_id = payload.call_id
         self.tool_name = payload.name
+        self._separator = " · " if unicode else " - "
         self._details = Static(
             _started_details(payload),
             classes="tool-details",
@@ -110,13 +112,18 @@ class ToolCard(Collapsible):
             self._details,
             title=f"EXECUTING {payload.name}",
             collapsed=True,
+            collapsed_symbol="▶" if unicode else ">",
+            expanded_symbol="▼" if unicode else "v",
             classes="card tool-card",
         )
 
     def finish(self, payload: ToolFinishedPayload) -> None:
         if payload.call_id != self.call_id:
             raise ValueError("Tool completion does not match this card.")
-        self.title = f"{payload.status.upper()} {payload.name} · {payload.duration_ms}ms"
+        self.title = (
+            f"{payload.status.upper()} {payload.name}"
+            f"{self._separator}{payload.duration_ms}ms"
+        )
         details = []
         if payload.error_message:
             details.append(f"error: {payload.error_message}")
@@ -141,12 +148,15 @@ class ToolCard(Collapsible):
 
 
 class ErrorCard(Collapsible):
-    def __init__(self, payload: TurnErrorPayload) -> None:
+    def __init__(self, payload: TurnErrorPayload, *, unicode: bool = True) -> None:
         details = payload.technical_detail or "No additional technical details."
+        separator = " · " if unicode else " - "
         super().__init__(
             Static(details, markup=False),
-            title=f"ERROR · {payload.message}",
+            title=f"ERROR{separator}{payload.message}",
             collapsed=True,
+            collapsed_symbol="▶" if unicode else ">",
+            expanded_symbol="▼" if unicode else "v",
             classes="card error-card status-error",
         )
 

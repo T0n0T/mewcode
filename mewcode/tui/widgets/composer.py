@@ -55,12 +55,17 @@ class PromptComposer(TextArea):
             super().__init__()
             self.prompt = prompt
 
-    def __init__(self, history: PromptHistory | None = None) -> None:
+    def __init__(
+        self,
+        history: PromptHistory | None = None,
+        *,
+        unicode: bool = True,
+    ) -> None:
         super().__init__(
             "",
             compact=True,
             highlight_cursor_line=False,
-            placeholder="Describe a task…",
+            placeholder="Describe a task…" if unicode else "Describe a task...",
             id="prompt-composer",
         )
         self.prompt_history = history or PromptHistory()

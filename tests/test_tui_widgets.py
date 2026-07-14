@@ -111,6 +111,42 @@ def test_new_output_indicator_tracks_visibility_and_count():
     assert indicator.display is False
 
 
+def test_ascii_widget_variants_use_only_ascii_presentation_glyphs():
+    indicator = ActivityIndicator(clock=lambda: 1.0, unicode=False)
+    indicator.set_activity(ActivityState.UPLINKING, "model")
+    new_output = NewOutputIndicator(unicode=False)
+    new_output.set_count(2)
+    tool = ToolCard(
+        ToolStartedPayload(1, "call-1", "read_file", "path=README.md", 1.0),
+        unicode=False,
+    )
+    tool.finish(
+        ToolFinishedPayload(
+            1,
+            "call-1",
+            "read_file",
+            "success",
+            9,
+            None,
+            None,
+        )
+    )
+    error = ErrorCard(
+        TurnErrorPayload(1, "Network unavailable"),
+        unicode=False,
+    )
+
+    values = (
+        indicator.render().plain,
+        str(new_output.label),
+        str(tool.title),
+        str(error.title),
+        PromptComposer(unicode=False).placeholder,
+    )
+    for value in values:
+        value.encode("ascii")
+
+
 def test_prompt_history_preserves_draft_and_navigation_boundaries():
     history = PromptHistory()
     history.record("first")
