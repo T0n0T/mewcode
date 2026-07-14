@@ -42,13 +42,6 @@ class ProviderResponseCompleted:
     usage: TokenUsage = TokenUsage(None, None, None)
 
 
-# Temporary migration aliases for the synchronous providers. They are removed
-# when both concrete adapters move to the asynchronous contract.
-TextDelta = ProviderTextDelta
-ToolCallDelta = ProviderToolCallDelta
-ResponseCompleted = ProviderResponseCompleted
-
-
 ProviderEvent = ProviderTextDelta | ProviderToolCallDelta | ProviderResponseCompleted
 
 

@@ -1,45 +1,52 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Sequence
-from contextlib import AbstractContextManager
+from collections.abc import AsyncIterator, Iterator, Sequence
 from typing import Any
 
 import httpx
 
+from mewcode.cancellation import CancellationToken
 from mewcode.config import LLMConfig
 from mewcode.errors import ProviderError, redact_secrets
-from mewcode.providers.base import (
+from mewcode.messages import (
     AssistantMessage,
     ConversationMessage,
-    ProviderEvent,
-    ResponseCompleted,
-    TextDelta,
-    ToolCallDelta,
     ToolResultsMessage,
     UserMessage,
 )
-from mewcode.providers.sse import iter_sse_events, stream_closer
+from mewcode.providers.base import (
+    ProviderEvent,
+    ProviderResponseCompleted,
+    ProviderTextDelta,
+    ProviderToolCallDelta,
+    TokenUsage,
+)
+from mewcode.providers.sse import iter_sse_events
 from mewcode.tools.base import ToolDefinition
-from mewcode.turns import TurnCancellation, TurnInterrupted
 
 
 class OpenAIProvider:
     def __init__(self, config: LLMConfig, http_client: Any | None = None):
         self.config = config
-        self._http_client = http_client
+        self._owns_client = http_client is None
+        self._http_client = http_client or httpx.AsyncClient(timeout=None)
+        self._closed = False
 
-    def stream_response(
+    async def stream_response(
         self,
         history: Sequence[ConversationMessage],
         tools: Sequence[ToolDefinition],
-        cancellation: TurnCancellation,
-    ) -> Iterator[ProviderEvent]:
+        *,
+        instructions: str,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[ProviderEvent]:
         cancellation.raise_if_cancelled()
         url = f"{self.config.base_url}/responses"
         body: dict[str, Any] = {
             "model": self.config.model,
             "input": _serialize_history(history),
+            "instructions": instructions,
             "stream": True,
         }
         if tools:
@@ -52,46 +59,57 @@ class OpenAIProvider:
 
         completed = False
         try:
-            with self._stream("POST", url, headers=headers, json=body) as response:
-                with cancellation.bind_stream_closer(stream_closer(response)):
+            async with self._http_client.stream(
+                "POST", url, headers=headers, json=body
+            ) as response:
+                cancellation.raise_if_cancelled()
+                await self._raise_for_status(response)
+                async for event in iter_sse_events(response):
                     cancellation.raise_if_cancelled()
-                    self._raise_for_status(response)
-                    for event in iter_sse_events(response):
+                    for provider_event in _events_from_response(event.data, event.event):
                         cancellation.raise_if_cancelled()
-                        for provider_event in _events_from_response(event.data, event.event):
-                            cancellation.raise_if_cancelled()
-                            if isinstance(provider_event, ResponseCompleted):
-                                if completed:
-                                    raise ProviderError("OpenAI response emitted more than one completed event.")
-                                completed = True
-                            yield provider_event
-        except TurnInterrupted:
-            raise
+                        if isinstance(provider_event, ProviderResponseCompleted):
+                            if completed:
+                                raise ProviderError(
+                                    "OpenAI response emitted more than one completed event."
+                                )
+                            completed = True
+                        elif completed:
+                            raise ProviderError(
+                                "OpenAI response emitted an event after completion."
+                            )
+                        yield provider_event
         except ProviderError as exc:
             cancellation.raise_if_cancelled()
-            raise ProviderError(redact_secrets(exc.user_message, [self.config.api_key])) from exc
+            raise ProviderError(
+                redact_secrets(exc.user_message, [self.config.api_key])
+            ) from exc
         except httpx.HTTPError as exc:
             cancellation.raise_if_cancelled()
             message = redact_secrets(str(exc), [self.config.api_key])
             raise ProviderError(
-                f"OpenAI request failed for {url}: {message}. Check that base_url is correct and the provider service is running."
+                f"OpenAI request failed for {url}: {message}. Check that base_url is "
+                "correct and the provider service is running."
             ) from exc
 
         cancellation.raise_if_cancelled()
         if not completed:
             raise ProviderError("OpenAI response ended without a completed event.")
 
-    def _stream(self, method: str, url: str, **kwargs: Any) -> AbstractContextManager[Any]:
-        if self._http_client is not None:
-            return self._http_client.stream(method, url, **kwargs)
-        client = httpx.Client(timeout=None)
-        return _ClosingStreamContext(client, client.stream(method, url, **kwargs))
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._owns_client:
+            await self._http_client.aclose()
 
-    def _raise_for_status(self, response: Any) -> None:
+    async def _raise_for_status(self, response: Any) -> None:
         status_code = getattr(response, "status_code", 200)
         if status_code < 400:
             return
-        raise ProviderError(f"OpenAI API returned HTTP {status_code}: {_response_text(response)}")
+        raise ProviderError(
+            f"OpenAI API returned HTTP {status_code}: {await _response_text(response)}"
+        )
 
 
 def _serialize_tool(tool: ToolDefinition) -> dict[str, Any]:
@@ -129,69 +147,74 @@ def _serialize_history(history: Sequence[ConversationMessage]) -> list[dict[str,
     return items
 
 
-def _events_from_response(data: dict[str, Any], event_name: str | None) -> Iterator[ProviderEvent]:
+def _events_from_response(
+    data: dict[str, Any], event_name: str | None
+) -> Iterator[ProviderEvent]:
     event_type = str(data.get("type") or event_name or "")
     if event_name == "error" or event_type == "error" or "error" in data:
         raise ProviderError(f"OpenAI API error: {_extract_error_message(data)}")
     if event_type == "response.failed":
         raise ProviderError(f"OpenAI response failed: {_extract_error_message(data)}")
 
-    if event_type in {"response.output_text.delta", "response.text.delta"} or event_type.endswith(
-        ".output_text.delta"
-    ):
+    if event_type in {
+        "response.output_text.delta",
+        "response.text.delta",
+    } or event_type.endswith(".output_text.delta"):
         delta = data.get("delta")
         if isinstance(delta, str):
-            yield TextDelta(delta)
+            yield ProviderTextDelta(delta)
         return
-
     if event_type == "response.output_item.added":
         item = data.get("item")
         slot = data.get("output_index")
-        if isinstance(item, dict) and item.get("type") == "function_call" and isinstance(slot, int):
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "function_call"
+            and isinstance(slot, int)
+        ):
             call_id = item.get("call_id")
             name = item.get("name")
-            yield ToolCallDelta(
+            yield ProviderToolCallDelta(
                 slot,
                 call_id_delta=call_id if isinstance(call_id, str) else "",
                 name_delta=name if isinstance(name, str) else "",
             )
         return
-
     if event_type == "response.function_call_arguments.delta":
         slot = data.get("output_index")
         delta = data.get("delta")
         if isinstance(slot, int) and isinstance(delta, str):
-            yield ToolCallDelta(slot, arguments_delta=delta)
+            yield ProviderToolCallDelta(slot, arguments_delta=delta)
         return
-
     if event_type == "response.completed":
         response = data.get("response")
         output = response.get("output") if isinstance(response, dict) else None
         if not isinstance(output, list):
-            raise ProviderError("OpenAI completed response did not include an output list.")
-        yield ResponseCompleted(output)
+            raise ProviderError(
+                "OpenAI completed response did not include an output list."
+            )
+        usage = response.get("usage") if isinstance(response, dict) else None
+        yield ProviderResponseCompleted(output, _normalize_usage(usage))
 
 
-class _ClosingStreamContext:
-    def __init__(self, client: httpx.Client, stream_context: AbstractContextManager[Any]):
-        self._client = client
-        self._stream_context = stream_context
-
-    def __enter__(self) -> Any:
-        return self._stream_context.__enter__()
-
-    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool | None:
-        try:
-            return self._stream_context.__exit__(exc_type, exc, traceback)
-        finally:
-            self._client.close()
+def _normalize_usage(value: Any) -> TokenUsage:
+    usage = value if isinstance(value, dict) else {}
+    return TokenUsage(
+        _non_negative_int(usage.get("input_tokens")),
+        _non_negative_int(usage.get("output_tokens")),
+        _non_negative_int(usage.get("total_tokens")),
+    )
 
 
-def _response_text(response: Any) -> str:
+def _non_negative_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+async def _response_text(response: Any) -> str:
     try:
-        read = getattr(response, "read", None)
+        read = getattr(response, "aread", None)
         if callable(read):
-            read()
+            await read()
         return str(getattr(response, "text", ""))
     except Exception:
         return ""
