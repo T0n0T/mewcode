@@ -8,6 +8,14 @@ from mewcode.errors import MewCodeError, redact_secrets
 from mewcode.providers.base import ToolCall
 from mewcode.runtime import ChatRuntime
 from mewcode.tools.base import ConfirmationPreview, JSONValue, ToolResult
+from mewcode.turns import (
+    TurnCancellation,
+    TurnCompleted,
+    TurnInterrupted,
+    TurnPhase,
+    TurnPhaseChanged,
+    TurnTextDelta,
+)
 
 EXIT_COMMANDS = {"exit", "quit"}
 
@@ -16,7 +24,7 @@ CAT_BANNER = r""" /\_/\
  > ^ <"""
 
 
-class TerminalToolInteraction:
+class PlainToolInteraction:
     def __init__(
         self,
         input_stream: TextIO | None = None,
@@ -29,9 +37,9 @@ class TerminalToolInteraction:
         self.secrets = secrets
 
     def tool_started(self, call: ToolCall) -> None:
-        summary = _argument_summary(call.arguments, self.secrets)
+        summary = argument_summary(call.arguments, self.secrets)
         suffix = f" ({summary})" if summary else ""
-        self._write(f"\n   Tool: {call.name}{suffix} ...\n")
+        self._write(f"   [EXECUTING {call.name}]{suffix}\n")
 
     def confirm(self, preview: ConfirmationPreview) -> bool:
         title = redact_secrets(preview.title, self.secrets)
@@ -46,17 +54,20 @@ class TerminalToolInteraction:
         else:
             message = redact_secrets(result.error.message, self.secrets)
             detail = f"{result.status}: {message}"
-        self._write(f"   Tool {call.name}: {detail}\n")
+        self._write(f"   [TOOL {call.name}] {detail}\n")
 
     def tool_budget_exhausted(self) -> None:
-        self._write("\n   Tool limit reached for this turn; the additional request was not executed.\n")
+        self._write("   [TOOL LIMIT] Additional request was not executed.\n")
 
     def _write(self, text: str) -> None:
         self.output_stream.write(text)
         self.output_stream.flush()
 
 
-def _argument_summary(arguments: dict[str, JSONValue], secrets: tuple[str, ...]) -> str:
+def argument_summary(
+    arguments: dict[str, JSONValue],
+    secrets: tuple[str, ...],
+) -> str:
     visible_keys = ("path", "pattern", "query", "command")
     parts: list[str] = []
     for key in visible_keys:
@@ -66,7 +77,7 @@ def _argument_summary(arguments: dict[str, JSONValue], secrets: tuple[str, ...])
     return ", ".join(parts)
 
 
-class ChatApp:
+class PlainChatApp:
     def __init__(
         self,
         runtime: ChatRuntime,
@@ -78,15 +89,16 @@ class ChatApp:
         self.config = config
         self.input_stream = input_stream or sys.stdin
         self.output_stream = output_stream or sys.stdout
+        unicode_output = supports_unicode(self.output_stream)
+        self.user_marker = "›" if unicode_output else ">"
+        self.mewcode_marker = "◆" if unicode_output else "*"
 
     def run(self) -> int:
         self._write_header()
 
         while True:
-            self._write("\n╭─ you\n╰─ ")
             line = self.input_stream.readline()
             if line == "":
-                self._write("\n")
                 return 0
 
             user_text = line.rstrip("\n")
@@ -96,13 +108,37 @@ class ChatApp:
                 self._write("Bye.\n")
                 return 0
 
-            self._write("╰─ assistant\n   ")
+            self._write(f"\n{self.user_marker} {user_text}\n")
+            cancellation = TurnCancellation()
+            response_started = False
             try:
-                for chunk in self.runtime.stream_turn(user_text):
-                    self._write(chunk)
-                self._write("\n")
+                for event in self.runtime.stream_turn(user_text, cancellation):
+                    if isinstance(event, TurnPhaseChanged):
+                        if response_started:
+                            self._write("\n")
+                            response_started = False
+                        label = (
+                            f"UPLINKING {self.config.model}"
+                            if event.phase is TurnPhase.INITIAL_RESPONSE
+                            else "SYNTHESIZING"
+                        )
+                        self._write(f"{self.mewcode_marker} [{label}]\n")
+                    elif isinstance(event, TurnTextDelta):
+                        if not response_started:
+                            self._write(f"{self.mewcode_marker} ")
+                            response_started = True
+                        self._write(event.text)
+                    elif isinstance(event, TurnCompleted) and response_started:
+                        self._write("\n")
+                        response_started = False
+            except TurnInterrupted:
+                if response_started:
+                    self._write("\n")
+                self._write(f"{self.mewcode_marker} [INTERRUPTED]\n")
             except MewCodeError as exc:
-                self._write(f"\nError: {exc.user_message}\n")
+                if response_started:
+                    self._write("\n")
+                self._write(f"ERROR: {exc.user_message}\n")
 
     def _write(self, text: str) -> None:
         self.output_stream.write(text)
@@ -111,11 +147,20 @@ class ChatApp:
     def _write_header(self) -> None:
         self._write(
             f"{CAT_BANNER}\n"
-            "\n"
-            "MewCode\n"
-            f"  config   {self.config.name}\n"
-            f"  provider {self.config.protocol}\n"
-            f"  model    {self.config.model}\n"
-            "\n"
+            "MEWCODE // CYBER TERMINAL\n"
+            f"config   {self.config.name}\n"
+            f"provider {self.config.protocol}\n"
+            f"model    {self.config.model}\n"
             "Type 'exit' or 'quit' to end the session.\n"
         )
+
+
+def supports_unicode(output_stream: TextIO) -> bool:
+    encoding = getattr(output_stream, "encoding", None)
+    if not encoding:
+        return True
+    try:
+        "›◆─".encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True

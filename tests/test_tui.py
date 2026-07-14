@@ -8,6 +8,7 @@ from mewcode.providers.base import ResponseCompleted, TextDelta, ToolCall
 from mewcode.runtime import ChatRuntime
 from mewcode.tools.base import ConfirmationPreview, ToolErrorInfo, ToolResult
 from mewcode.tui import ChatApp, TerminalToolInteraction
+from mewcode.turns import TurnCompleted, TurnPhase, TurnPhaseChanged, TurnTextDelta
 
 
 class TrackingOutput(StringIO):
@@ -26,11 +27,14 @@ class FakeRuntime:
         self.error = error
         self.inputs = []
 
-    def stream_turn(self, user_text):
+    def stream_turn(self, user_text, cancellation):
         self.inputs.append(user_text)
+        yield TurnPhaseChanged(TurnPhase.INITIAL_RESPONSE)
         if self.error is not None:
             raise self.error
-        yield from self.chunks
+        for chunk in self.chunks:
+            yield TurnTextDelta(chunk)
+        yield TurnCompleted()
 
 
 def config():
@@ -56,7 +60,8 @@ def test_tui_streams_chunks_and_flushes():
     assert app.run() == 0
 
     assert runtime.inputs == ["Hi"]
-    assert "╰─ assistant" in output.getvalue()
+    assert "assistant" not in output.getvalue().lower()
+    assert "◆ Hello" in output.getvalue()
     assert "Hello" in output.getvalue()
     assert output.flush_count >= 2
 
@@ -75,9 +80,9 @@ def test_tui_renders_claude_like_header_with_cat():
 
     text = output.getvalue()
     assert "/\\_/\\" in text
-    assert "MewCode" in text
+    assert "MEWCODE" in text
     assert "openai" in text
-    assert "╭─ you" in text
+    assert "MEWCODE // CYBER TERMINAL" in text
 
 
 def test_tui_ignores_empty_input():
@@ -136,7 +141,7 @@ def test_tui_prints_runtime_error_and_continues():
     assert app.run() == 0
 
     text = output.getvalue()
-    assert "Error: temporary failure" in text
+    assert "ERROR: temporary failure" in text
     assert "Bye." in text
 
 
@@ -173,7 +178,7 @@ api_key: secret
     code = main(config_path=config_path, stdin=StringIO("Hi\nexit\n"), stdout=stdout, stderr=StringIO())
 
     assert code == 0
-    assert "╰─ assistant" in stdout.getvalue()
+    assert "assistant" not in stdout.getvalue().lower()
     assert "ok" in stdout.getvalue()
 
 
@@ -230,7 +235,7 @@ def test_tui_uses_uniform_runtime_interface_for_anthropic_config():
     )
 
     assert app.run() == 0
-    assert "╰─ assistant" in output.getvalue()
+    assert "assistant" not in output.getvalue().lower()
     assert "same" in output.getvalue()
 
 
