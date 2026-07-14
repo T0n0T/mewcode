@@ -106,8 +106,8 @@ class ResponseCollector:
             )
             for slot, parts in sorted(calls.items())
         )
-        nonempty_ids = [parts[0] for parts in calls.values() if parts[0]]
-        if len(nonempty_ids) != len(set(nonempty_ids)):
+        call_ids = [call.call_id for call in raw_calls]
+        if len(call_ids) != len(set(call_ids)):
             raise ProviderError("Provider emitted a duplicate tool call ID.")
         return CollectedResponse(
             "".join(text_parts),

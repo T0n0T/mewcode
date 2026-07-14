@@ -168,6 +168,22 @@ async def test_duplicate_id_is_rejected_without_a_collected_response():
 
 
 @pytest.mark.asyncio
+async def test_provider_id_cannot_collide_with_a_fallback_id():
+    with pytest.raises(ProviderError, match="duplicate tool call ID"):
+        await collect(
+            FakeProvider(
+                [
+                    ProviderToolCallDelta(
+                        1, call_id_delta="run-1:2:3", name_delta="first"
+                    ),
+                    ProviderToolCallDelta(3, name_delta="second"),
+                    ProviderResponseCompleted([]),
+                ]
+            )
+        )
+
+
+@pytest.mark.asyncio
 async def test_provider_error_leaves_forwarded_text_visible_but_no_response():
     seen = []
 
