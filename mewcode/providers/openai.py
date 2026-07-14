@@ -21,6 +21,7 @@ from mewcode.providers.base import (
 )
 from mewcode.providers.sse import iter_sse_events
 from mewcode.tools.base import ToolDefinition
+from mewcode.turns import TurnCancellation, TurnInterrupted
 
 
 class OpenAIProvider:
@@ -32,7 +33,9 @@ class OpenAIProvider:
         self,
         history: Sequence[ConversationMessage],
         tools: Sequence[ToolDefinition],
+        cancellation: TurnCancellation,
     ) -> Iterator[ProviderEvent]:
+        cancellation.raise_if_cancelled()
         url = f"{self.config.base_url}/responses"
         body: dict[str, Any] = {
             "model": self.config.model,
@@ -50,22 +53,31 @@ class OpenAIProvider:
         completed = False
         try:
             with self._stream("POST", url, headers=headers, json=body) as response:
-                self._raise_for_status(response)
-                for event in iter_sse_events(response):
-                    for provider_event in _events_from_response(event.data, event.event):
-                        if isinstance(provider_event, ResponseCompleted):
-                            if completed:
-                                raise ProviderError("OpenAI response emitted more than one completed event.")
-                            completed = True
-                        yield provider_event
+                with cancellation.bind_stream_closer(_stream_closer(response)):
+                    cancellation.raise_if_cancelled()
+                    self._raise_for_status(response)
+                    for event in iter_sse_events(response):
+                        cancellation.raise_if_cancelled()
+                        for provider_event in _events_from_response(event.data, event.event):
+                            cancellation.raise_if_cancelled()
+                            if isinstance(provider_event, ResponseCompleted):
+                                if completed:
+                                    raise ProviderError("OpenAI response emitted more than one completed event.")
+                                completed = True
+                            yield provider_event
+        except TurnInterrupted:
+            raise
         except ProviderError as exc:
+            cancellation.raise_if_cancelled()
             raise ProviderError(redact_secrets(exc.user_message, [self.config.api_key])) from exc
         except httpx.HTTPError as exc:
+            cancellation.raise_if_cancelled()
             message = redact_secrets(str(exc), [self.config.api_key])
             raise ProviderError(
                 f"OpenAI request failed for {url}: {message}. Check that base_url is correct and the provider service is running."
             ) from exc
 
+        cancellation.raise_if_cancelled()
         if not completed:
             raise ProviderError("OpenAI response ended without a completed event.")
 
@@ -183,6 +195,11 @@ def _response_text(response: Any) -> str:
         return str(getattr(response, "text", ""))
     except Exception:
         return ""
+
+
+def _stream_closer(response: Any) -> Any:
+    closer = getattr(response, "close", None)
+    return closer if callable(closer) else lambda: None
 
 
 def _extract_error_message(data: dict[str, Any]) -> str:

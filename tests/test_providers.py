@@ -18,6 +18,7 @@ from mewcode.providers.base import (
 )
 from mewcode.providers.openai import OpenAIProvider
 from mewcode.tools.base import ToolDefinition, ToolResult
+from mewcode.turns import TurnCancellation, TurnInterrupted
 
 
 class MockStream:
@@ -32,16 +33,24 @@ class MockStream:
 
 
 class MockResponse:
-    def __init__(self, lines=None, status_code=200, text=""):
+    def __init__(self, lines=None, status_code=200, text="", on_line=None):
         self._lines = lines or []
         self.status_code = status_code
         self.text = text
+        self.on_line = on_line
+        self.close_calls = 0
 
     def iter_lines(self):
-        yield from self._lines
+        for index, line in enumerate(self._lines):
+            yield line
+            if self.on_line is not None:
+                self.on_line(index)
 
     def read(self):
         return None
+
+    def close(self):
+        self.close_calls += 1
 
 
 class MockHTTPClient:
@@ -107,6 +116,16 @@ def feedback():
     )
 
 
+def collect_events(provider, history=(), tools=(), cancellation=None):
+    return list(
+        provider.stream_response(
+            history,
+            tools,
+            cancellation or TurnCancellation(),
+        )
+    )
+
+
 def test_base_types_hide_provider_state():
     state = {"secret": "protocol state"}
     assistant = AssistantMessage("hello", state)
@@ -142,10 +161,10 @@ def test_openai_tools_user_message_text_delta_and_completed(openai_config, tool_
         "",
     ]
     client = MockHTTPClient(MockResponse(lines))
-    events = list(
-        OpenAIProvider(openai_config, http_client=client).stream_response(
-            [UserMessage("Hello")], [tool_definition]
-        )
+    events = collect_events(
+        OpenAIProvider(openai_config, http_client=client),
+        [UserMessage("Hello")],
+        [tool_definition],
     )
 
     assert events == [TextDelta("Hi"), ResponseCompleted(output)]
@@ -168,11 +187,10 @@ def test_openai_history_feedback_and_empty_tools(openai_config):
     client = MockHTTPClient(MockResponse(lines))
     provider = OpenAIProvider(openai_config, http_client=client)
 
-    list(
-        provider.stream_response(
-            [UserMessage("read"), AssistantMessage("", state), ToolResultsMessage((feedback(),))],
-            [],
-        )
+    collect_events(
+        provider,
+        [UserMessage("read"), AssistantMessage("", state), ToolResultsMessage((feedback(),))],
+        [],
     )
 
     body = client.calls[0][2]["json"]
@@ -198,7 +216,7 @@ def test_openai_tool_call_deltas_share_slot(openai_config):
         *sse({"type": "response.function_call_arguments.delta", "output_index": 0, "delta": '"a"}'}),
         *sse({"type": "response.completed", "response": {"output": output}}),
     ]
-    events = list(OpenAIProvider(openai_config, MockHTTPClient(MockResponse(lines))).stream_response([], []))
+    events = collect_events(OpenAIProvider(openai_config, MockHTTPClient(MockResponse(lines))))
 
     assert events[:3] == [
         ToolCallDelta(0, call_id_delta="call-1", name_delta="read_file"),
@@ -215,7 +233,7 @@ def test_openai_tool_deltas_keep_multiple_slots_separate(openai_config):
         *sse({"type": "response.function_call_arguments.delta", "output_index": 1, "delta": "{}"}),
         *sse({"type": "response.completed", "response": {"output": []}}),
     ]
-    events = list(OpenAIProvider(openai_config, MockHTTPClient(MockResponse(lines))).stream_response([], []))
+    events = collect_events(OpenAIProvider(openai_config, MockHTTPClient(MockResponse(lines))))
     deltas = [event for event in events if isinstance(event, ToolCallDelta)]
     assert [event.slot for event in deltas] == [0, 1, 0, 1]
 
@@ -223,7 +241,7 @@ def test_openai_tool_deltas_keep_multiple_slots_separate(openai_config):
 def test_openai_requires_completed_event(openai_config):
     client = MockHTTPClient(MockResponse([*sse({"type": "response.output_text.delta", "delta": "partial"}), "data: [DONE]", ""]))
     with pytest.raises(ProviderError, match="without a completed event"):
-        list(OpenAIProvider(openai_config, client).stream_response([], []))
+        collect_events(OpenAIProvider(openai_config, client))
 
 
 def test_openai_redacts_http_and_stream_errors(openai_config):
@@ -232,12 +250,12 @@ def test_openai_redacts_http_and_stream_errors(openai_config):
         MockHTTPClient(MockResponse(status_code=401, text="bad openai-secret")),
     )
     with pytest.raises(ProviderError) as exc_info:
-        list(provider.stream_response([], []))
+        collect_events(provider)
     assert "openai-secret" not in str(exc_info.value)
 
     client = MockHTTPClient(MockResponse(sse({"type": "error", "error": {"message": "bad things"}}, "error")))
     with pytest.raises(ProviderError, match="bad things"):
-        list(OpenAIProvider(openai_config, client).stream_response([], []))
+        collect_events(OpenAIProvider(openai_config, client))
 
 
 def test_openai_connection_error_has_url_hint(openai_config):
@@ -246,7 +264,7 @@ def test_openai_connection_error_has_url_hint(openai_config):
             raise httpx.ConnectError("connection refused", request=httpx.Request(method, url))
 
     with pytest.raises(ProviderError) as exc_info:
-        list(OpenAIProvider(openai_config, FailingHTTPClient()).stream_response([], []))
+        collect_events(OpenAIProvider(openai_config, FailingHTTPClient()))
     assert "https://api.openai.test/v1/responses" in str(exc_info.value)
     assert "base_url" in str(exc_info.value)
 
@@ -261,10 +279,10 @@ def test_anthropic_tools_text_tool_delta_and_completed(anthropic_config, tool_de
         *sse({"type": "message_stop"}, "message_stop"),
     ]
     client = MockHTTPClient(MockResponse(lines))
-    events = list(
-        AnthropicProvider(anthropic_config, client).stream_response(
-            [UserMessage("Hello")], [tool_definition]
-        )
+    events = collect_events(
+        AnthropicProvider(anthropic_config, client),
+        [UserMessage("Hello")],
+        [tool_definition],
     )
 
     assert events[:3] == [
@@ -287,7 +305,7 @@ def test_anthropic_tool_deltas_keep_multiple_slots_separate(anthropic_config):
         *sse({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
         *sse({"type": "message_stop"}),
     ]
-    events = list(AnthropicProvider(anthropic_config, MockHTTPClient(MockResponse(lines))).stream_response([], []))
+    events = collect_events(AnthropicProvider(anthropic_config, MockHTTPClient(MockResponse(lines))))
     deltas = [event for event in events if isinstance(event, ToolCallDelta)]
     assert [event.slot for event in deltas] == [0, 2, 0, 2]
 
@@ -295,15 +313,14 @@ def test_anthropic_tool_deltas_keep_multiple_slots_separate(anthropic_config):
 def test_anthropic_history_feedback_merges_adjacent_user_content(anthropic_config):
     blocks = [{"type": "tool_use", "id": "call-1", "name": "read_file", "input": {"path": "a"}}]
     client = MockHTTPClient(MockResponse(sse({"type": "message_stop"}, "message_stop")))
-    list(
-        AnthropicProvider(anthropic_config, client).stream_response(
-            [
-                AssistantMessage("", blocks),
-                ToolResultsMessage((feedback(),)),
-                UserMessage("continue"),
-            ],
-            [],
-        )
+    collect_events(
+        AnthropicProvider(anthropic_config, client),
+        [
+            AssistantMessage("", blocks),
+            ToolResultsMessage((feedback(),)),
+            UserMessage("continue"),
+        ],
+        [],
     )
 
     body = client.calls[0][2]["json"]
@@ -322,18 +339,18 @@ def test_anthropic_thinking_is_preserved_but_not_displayed(anthropic_config):
         *sse({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig"}}, "content_block_delta"),
         *sse({"type": "message_stop"}, "message_stop"),
     ]
-    events = list(AnthropicProvider(anthropic_config, MockHTTPClient(MockResponse(lines))).stream_response([], []))
+    events = collect_events(AnthropicProvider(anthropic_config, MockHTTPClient(MockResponse(lines))))
     assert events == [ResponseCompleted([{"type": "thinking", "thinking": "hidden", "signature": "sig"}])]
 
 
 def test_anthropic_requires_message_stop_and_redacts_errors(anthropic_config):
     client = MockHTTPClient(MockResponse(sse({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "partial"}})))
     with pytest.raises(ProviderError, match="without a completed event"):
-        list(AnthropicProvider(anthropic_config, client).stream_response([], []))
+        collect_events(AnthropicProvider(anthropic_config, client))
 
     client = MockHTTPClient(MockResponse(status_code=401, text="bad anthropic-secret"))
     with pytest.raises(ProviderError) as exc_info:
-        list(AnthropicProvider(anthropic_config, client).stream_response([], []))
+        collect_events(AnthropicProvider(anthropic_config, client))
     assert "anthropic-secret" not in str(exc_info.value)
 
 
@@ -347,5 +364,49 @@ def test_anthropic_omits_thinking_when_disabled(anthropic_config):
         thinking=False,
     )
     client = MockHTTPClient(MockResponse(sse({"type": "message_stop"}, "message_stop")))
-    list(AnthropicProvider(config, client).stream_response([], []))
+    collect_events(AnthropicProvider(config, client))
     assert "thinking" not in client.calls[0][2]["json"]
+
+
+def test_openai_cancellation_stops_before_request_and_closes_active_stream(openai_config):
+    cancellation = TurnCancellation()
+    client = MockHTTPClient(MockResponse(sse({"type": "response.completed", "response": {"output": []}})))
+    cancellation.cancel()
+
+    with pytest.raises(TurnInterrupted):
+        collect_events(OpenAIProvider(openai_config, client), cancellation=cancellation)
+    assert client.calls == []
+
+    cancellation = TurnCancellation()
+    response = MockResponse(
+        sse({"type": "response.output_text.delta", "delta": "partial"}),
+        on_line=lambda index: cancellation.cancel() if index == 0 else None,
+    )
+    with pytest.raises(TurnInterrupted):
+        collect_events(
+            OpenAIProvider(openai_config, MockHTTPClient(response)),
+            cancellation=cancellation,
+        )
+    assert response.close_calls == 1
+
+
+def test_anthropic_cancellation_stops_before_request_and_closes_active_stream(anthropic_config):
+    cancellation = TurnCancellation()
+    client = MockHTTPClient(MockResponse(sse({"type": "message_stop"})))
+    cancellation.cancel()
+
+    with pytest.raises(TurnInterrupted):
+        collect_events(AnthropicProvider(anthropic_config, client), cancellation=cancellation)
+    assert client.calls == []
+
+    cancellation = TurnCancellation()
+    response = MockResponse(
+        sse({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "partial"}}),
+        on_line=lambda index: cancellation.cancel() if index == 0 else None,
+    )
+    with pytest.raises(TurnInterrupted):
+        collect_events(
+            AnthropicProvider(anthropic_config, MockHTTPClient(response)),
+            cancellation=cancellation,
+        )
+    assert response.close_calls == 1

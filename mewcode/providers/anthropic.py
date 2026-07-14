@@ -21,6 +21,7 @@ from mewcode.providers.base import (
 )
 from mewcode.providers.sse import iter_sse_events
 from mewcode.tools.base import ToolDefinition
+from mewcode.turns import TurnCancellation, TurnInterrupted
 
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 4096
@@ -35,7 +36,9 @@ class AnthropicProvider:
         self,
         history: Sequence[ConversationMessage],
         tools: Sequence[ToolDefinition],
+        cancellation: TurnCancellation,
     ) -> Iterator[ProviderEvent]:
+        cancellation.raise_if_cancelled()
         body: dict[str, Any] = {
             "model": self.config.model,
             "messages": _serialize_history(history),
@@ -60,70 +63,78 @@ class AnthropicProvider:
 
         try:
             with self._stream("POST", url, headers=headers, json=body) as response:
-                self._raise_for_status(response)
-                for event in iter_sse_events(response):
-                    data = event.data
-                    event_type = str(data.get("type") or event.event or "")
-                    if event.event == "error" or event_type == "error":
-                        raise ProviderError(f"Anthropic API error: {_extract_error_message(data)}")
+                with cancellation.bind_stream_closer(_stream_closer(response)):
+                    cancellation.raise_if_cancelled()
+                    self._raise_for_status(response)
+                    for event in iter_sse_events(response):
+                        cancellation.raise_if_cancelled()
+                        data = event.data
+                        event_type = str(data.get("type") or event.event or "")
+                        if event.event == "error" or event_type == "error":
+                            raise ProviderError(f"Anthropic API error: {_extract_error_message(data)}")
 
-                    if event_type == "content_block_start":
-                        index = data.get("index")
-                        block = data.get("content_block")
-                        if isinstance(index, int) and isinstance(block, dict):
-                            blocks[index] = dict(block)
-                            if block.get("type") == "tool_use":
-                                call_id = block.get("id")
-                                name = block.get("name")
-                                argument_parts[index] = []
-                                yield ToolCallDelta(
-                                    index,
-                                    call_id_delta=call_id if isinstance(call_id, str) else "",
-                                    name_delta=name if isinstance(name, str) else "",
-                                )
-                        continue
-
-                    if event_type == "content_block_delta":
-                        index = data.get("index")
-                        delta = data.get("delta")
-                        if not isinstance(index, int) or not isinstance(delta, dict):
+                        if event_type == "content_block_start":
+                            index = data.get("index")
+                            block = data.get("content_block")
+                            if isinstance(index, int) and isinstance(block, dict):
+                                blocks[index] = dict(block)
+                                if block.get("type") == "tool_use":
+                                    call_id = block.get("id")
+                                    name = block.get("name")
+                                    argument_parts[index] = []
+                                    yield ToolCallDelta(
+                                        index,
+                                        call_id_delta=call_id if isinstance(call_id, str) else "",
+                                        name_delta=name if isinstance(name, str) else "",
+                                    )
                             continue
-                        block = blocks.get(index)
-                        delta_type = delta.get("type")
-                        if delta_type == "text_delta" and isinstance(delta.get("text"), str):
-                            text = delta["text"]
-                            if block is not None:
-                                block["text"] = str(block.get("text", "")) + text
-                            yield TextDelta(text)
-                        elif delta_type == "thinking_delta" and isinstance(delta.get("thinking"), str):
-                            if block is not None:
-                                block["thinking"] = str(block.get("thinking", "")) + delta["thinking"]
-                        elif delta_type == "signature_delta" and isinstance(delta.get("signature"), str):
-                            if block is not None:
-                                block["signature"] = str(block.get("signature", "")) + delta["signature"]
-                        elif delta_type == "input_json_delta" and isinstance(delta.get("partial_json"), str):
-                            part = delta["partial_json"]
-                            argument_parts.setdefault(index, []).append(part)
-                            yield ToolCallDelta(index, arguments_delta=part)
-                        continue
 
-                    if event_type == "message_stop":
-                        if completed:
-                            raise ProviderError("Anthropic response emitted more than one completed event.")
-                        for index, parts in argument_parts.items():
-                            if index in blocks and parts:
-                                try:
-                                    blocks[index]["input"] = json.loads("".join(parts))
-                                except json.JSONDecodeError:
-                                    blocks[index]["input"] = {}
-                        completed = True
-                        yield ResponseCompleted([blocks[index] for index in sorted(blocks)])
+                        if event_type == "content_block_delta":
+                            index = data.get("index")
+                            delta = data.get("delta")
+                            if not isinstance(index, int) or not isinstance(delta, dict):
+                                continue
+                            block = blocks.get(index)
+                            delta_type = delta.get("type")
+                            if delta_type == "text_delta" and isinstance(delta.get("text"), str):
+                                text = delta["text"]
+                                if block is not None:
+                                    block["text"] = str(block.get("text", "")) + text
+                                yield TextDelta(text)
+                            elif delta_type == "thinking_delta" and isinstance(delta.get("thinking"), str):
+                                if block is not None:
+                                    block["thinking"] = str(block.get("thinking", "")) + delta["thinking"]
+                            elif delta_type == "signature_delta" and isinstance(delta.get("signature"), str):
+                                if block is not None:
+                                    block["signature"] = str(block.get("signature", "")) + delta["signature"]
+                            elif delta_type == "input_json_delta" and isinstance(delta.get("partial_json"), str):
+                                part = delta["partial_json"]
+                                argument_parts.setdefault(index, []).append(part)
+                                yield ToolCallDelta(index, arguments_delta=part)
+                            continue
+
+                        if event_type == "message_stop":
+                            if completed:
+                                raise ProviderError("Anthropic response emitted more than one completed event.")
+                            for index, parts in argument_parts.items():
+                                if index in blocks and parts:
+                                    try:
+                                        blocks[index]["input"] = json.loads("".join(parts))
+                                    except json.JSONDecodeError:
+                                        blocks[index]["input"] = {}
+                            completed = True
+                            yield ResponseCompleted([blocks[index] for index in sorted(blocks)])
+        except TurnInterrupted:
+            raise
         except ProviderError as exc:
+            cancellation.raise_if_cancelled()
             raise ProviderError(redact_secrets(exc.user_message, [self.config.api_key])) from exc
         except httpx.HTTPError as exc:
+            cancellation.raise_if_cancelled()
             message = redact_secrets(str(exc), [self.config.api_key])
             raise ProviderError(f"Anthropic request failed: {message}") from exc
 
+        cancellation.raise_if_cancelled()
         if not completed:
             raise ProviderError("Anthropic response ended without a completed event.")
 
@@ -219,3 +230,8 @@ def _response_text(response: Any) -> str:
         return str(getattr(response, "text", ""))
     except Exception:
         return ""
+
+
+def _stream_closer(response: Any) -> Any:
+    closer = getattr(response, "close", None)
+    return closer if callable(closer) else lambda: None

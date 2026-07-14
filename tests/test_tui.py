@@ -163,7 +163,7 @@ api_key: secret
     )
 
     class FakeProvider:
-        def stream_response(self, history, tools):
+        def stream_response(self, history, tools, cancellation):
             yield TextDelta("ok")
             yield ResponseCompleted([])
 
@@ -188,7 +188,7 @@ def test_cli_fixes_current_directory_as_workspace(monkeypatch, tmp_path: Path):
     observed = {}
 
     class FakeProvider:
-        def stream_response(self, history, tools):
+        def stream_response(self, history, tools, cancellation):
             observed["tools"] = [tool.name for tool in tools]
             yield TextDelta("ok")
             yield ResponseCompleted([])
@@ -239,7 +239,7 @@ def test_end_to_end_history_with_fake_provider():
         def __init__(self):
             self.calls = []
 
-        def stream_response(self, history, tools):
+        def stream_response(self, history, tools, cancellation):
             self.calls.append(tuple(history))
             reply = f"reply-{len(self.calls)}"
             yield TextDelta(reply)

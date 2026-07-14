@@ -20,6 +20,14 @@ from mewcode.providers.base import (
 from mewcode.tools.base import ToolErrorInfo, ToolResult
 from mewcode.tools.executor import ToolExecutor
 from mewcode.tools.registry import ToolRegistry
+from mewcode.turns import (
+    TurnCancellation,
+    TurnCompleted,
+    TurnEvent,
+    TurnPhase,
+    TurnPhaseChanged,
+    TurnTextDelta,
+)
 
 
 @dataclass(frozen=True)
@@ -53,32 +61,54 @@ class ChatRuntime:
     def history(self) -> tuple[ConversationMessage, ...]:
         return tuple(self._history)
 
-    def stream_turn(self, user_text: str) -> Iterator[str]:
+    def stream_turn(
+        self,
+        user_text: str,
+        cancellation: TurnCancellation,
+    ) -> Iterator[TurnEvent]:
         self._history.append(UserMessage(user_text))
-        first = yield from self._collect(self._registry.definitions())
+        cancellation.raise_if_cancelled()
+        yield TurnPhaseChanged(TurnPhase.INITIAL_RESPONSE)
+        first = yield from self._collect(self._registry.definitions(), cancellation)
+        cancellation.raise_if_cancelled()
         self._history.append(AssistantMessage(first.text, first.provider_state))
         if not first.calls:
+            yield TurnCompleted()
             return
 
         feedback = self._feedback_for(first.calls)
         self._history.append(ToolResultsMessage(feedback))
+        cancellation.raise_if_cancelled()
 
-        final = yield from self._collect(())
+        yield TurnPhaseChanged(TurnPhase.FINAL_RESPONSE)
+        final = yield from self._collect((), cancellation)
+        cancellation.raise_if_cancelled()
         if final.calls:
             self._executor.interaction.tool_budget_exhausted()
+            yield TurnCompleted()
             return
         self._history.append(AssistantMessage(final.text, final.provider_state))
+        yield TurnCompleted()
 
-    def _collect(self, tools: Sequence) -> Iterator[str]:
+    def _collect(
+        self,
+        tools: Sequence,
+        cancellation: TurnCancellation,
+    ) -> Iterator[TurnEvent]:
         text_parts: list[str] = []
         calls: dict[int, list[str]] = {}
         provider_state: object | None = None
         completed = False
 
-        for event in self._provider.stream_response(tuple(self._history), tools):
+        for event in self._provider.stream_response(
+            tuple(self._history),
+            tools,
+            cancellation,
+        ):
+            cancellation.raise_if_cancelled()
             if isinstance(event, TextDelta):
                 text_parts.append(event.text)
-                yield event.text
+                yield TurnTextDelta(event.text)
             elif isinstance(event, ToolCallDelta):
                 parts = calls.setdefault(event.slot, ["", "", ""])
                 parts[0] += event.call_id_delta
@@ -90,6 +120,7 @@ class ChatRuntime:
                 completed = True
                 provider_state = event.provider_state
 
+        cancellation.raise_if_cancelled()
         if not completed:
             raise ProviderError("Provider response ended without a completed event.")
         raw_calls = tuple(

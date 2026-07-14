@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 from mewcode.tools.base import JSONValue, ToolDefinition, ToolResult
+from mewcode.turns import TurnCancellation
 
 ProviderProtocol = Literal["openai", "anthropic"]
 
@@ -66,5 +67,6 @@ class LLMProvider(Protocol):
         self,
         history: Sequence[ConversationMessage],
         tools: Sequence[ToolDefinition],
+        cancellation: TurnCancellation,
     ) -> Iterator[ProviderEvent]:
         """Yield unified provider events for the given conversation."""
