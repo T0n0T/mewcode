@@ -27,6 +27,7 @@ from mewcode.tools.base import (
     TruncationInfo,
 )
 from mewcode.tools.registry import ToolRegistry
+from mewcode.tools.defaults import create_default_registry
 
 
 class FakeTool:
@@ -209,3 +210,26 @@ def test_register_rejects_empty_and_duplicate_names():
 def test_schema_rejects_invalid_definitions(schema):
     with pytest.raises(ValueError):
         ToolRegistry().register(FakeTool(schema=schema))
+
+
+def test_default_registry_builtin_policy_and_registration_order():
+    registry = create_default_registry()
+
+    assert [definition.name for definition in registry.definitions()] == [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "run_command",
+        "glob_files",
+        "search_code",
+    ]
+    for name in ("read_file", "glob_files", "search_code"):
+        descriptor = registry.descriptor(name)
+        assert descriptor.access is ToolAccess.READ_ONLY
+        assert descriptor.execution_policy is ToolExecutionPolicy.PARALLEL_SAFE
+        assert descriptor.requires_confirmation is False
+    for name in ("write_file", "edit_file", "run_command"):
+        descriptor = registry.descriptor(name)
+        assert descriptor.access is ToolAccess.MUTATING
+        assert descriptor.execution_policy is ToolExecutionPolicy.SERIAL
+        assert descriptor.requires_confirmation is True

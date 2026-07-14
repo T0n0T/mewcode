@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import re
 from collections.abc import Mapping
@@ -10,6 +11,8 @@ from mewcode.tools.base import (
     PreparedToolAction,
     ToolContext,
     ToolDefinition,
+    ToolAccess,
+    ToolExecutionPolicy,
     ToolResult,
 )
 
@@ -40,22 +43,32 @@ class GlobFilesTool:
             ["pattern"],
         ),
     )
+    access = ToolAccess.READ_ONLY
+    execution_policy = ToolExecutionPolicy.PARALLEL_SAFE
     requires_confirmation = False
+    manages_own_timeout = False
 
-    def prepare(
+    async def prepare(
         self, arguments: Mapping[str, JSONValue], context: ToolContext
     ) -> PreparedToolAction:
+        context.cancellation.raise_if_cancelled()
+        context.deadline.check()
         pattern = str(arguments["pattern"])
         _validate_pattern(pattern)
         return PreparedToolAction(dict(arguments), None, pattern)
 
-    def execute(self, action: PreparedToolAction, context: ToolContext) -> ToolResult:
+    async def execute(
+        self, action: PreparedToolAction, context: ToolContext
+    ) -> ToolResult:
         pattern = str(action.state)
-        paths = [
-            context.workspace.relative(path)
-            for path in context.workspace.walk_files(context.deadline)
-            if _glob_match(context.workspace.relative(path), pattern)
-        ]
+        paths: list[str] = []
+        async for path in context.workspace.walk_files(
+            context.deadline, context.cancellation
+        ):
+            context.cancellation.raise_if_cancelled()
+            relative = context.workspace.relative(path)
+            if _glob_match(relative, pattern):
+                paths.append(relative)
         return ToolResult(
             status="success",
             data={"pattern": pattern, "paths": paths, "count": len(paths)},
@@ -75,11 +88,16 @@ class SearchCodeTool:
             ["query"],
         ),
     )
+    access = ToolAccess.READ_ONLY
+    execution_policy = ToolExecutionPolicy.PARALLEL_SAFE
     requires_confirmation = False
+    manages_own_timeout = False
 
-    def prepare(
+    async def prepare(
         self, arguments: Mapping[str, JSONValue], context: ToolContext
     ) -> PreparedToolAction:
+        context.cancellation.raise_if_cancelled()
+        context.deadline.check()
         query = str(arguments["query"])
         path_pattern = arguments.get("path_pattern")
         if path_pattern is not None:
@@ -92,7 +110,9 @@ class SearchCodeTool:
                 raise ToolInputError("invalid_regex", f"Invalid regular expression: {exc}") from exc
         return PreparedToolAction(dict(arguments), None, compiled)
 
-    def execute(self, action: PreparedToolAction, context: ToolContext) -> ToolResult:
+    async def execute(
+        self, action: PreparedToolAction, context: ToolContext
+    ) -> ToolResult:
         query = str(action.arguments["query"])
         path_pattern_value = action.arguments.get("path_pattern")
         path_pattern = str(path_pattern_value) if path_pattern_value is not None else None
@@ -102,15 +122,19 @@ class SearchCodeTool:
         skipped_encoding = 0
         searched_files = 0
 
-        for path in context.workspace.walk_files(context.deadline):
+        async for path in context.workspace.walk_files(
+            context.deadline, context.cancellation
+        ):
+            context.cancellation.raise_if_cancelled()
             relative = context.workspace.relative(path)
             if path_pattern is not None and not _glob_match(relative, path_pattern):
                 continue
             try:
-                raw = path.read_bytes()
+                raw = await asyncio.to_thread(path.read_bytes)
             except OSError:
                 continue
             context.deadline.check()
+            context.cancellation.raise_if_cancelled()
             if b"\x00" in raw:
                 skipped_binary += 1
                 continue
@@ -122,6 +146,7 @@ class SearchCodeTool:
             searched_files += 1
             for line_number, line in enumerate(text.splitlines(), start=1):
                 context.deadline.check()
+                context.cancellation.raise_if_cancelled()
                 found = compiled.search(line) is not None if compiled is not None else query in line
                 if found:
                     matches.append(
