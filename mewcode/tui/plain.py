@@ -8,6 +8,7 @@ from mewcode.errors import MewCodeError, redact_secrets
 from mewcode.providers.base import ToolCall
 from mewcode.runtime import ChatRuntime
 from mewcode.tools.base import ConfirmationPreview, JSONValue, ToolResult
+from mewcode.tui.mode import supports_unicode
 from mewcode.turns import (
     TurnCancellation,
     TurnCompleted,
@@ -153,14 +154,3 @@ class PlainChatApp:
             f"model    {self.config.model}\n"
             "Type 'exit' or 'quit' to end the session.\n"
         )
-
-
-def supports_unicode(output_stream: TextIO) -> bool:
-    encoding = getattr(output_stream, "encoding", None)
-    if not encoding:
-        return True
-    try:
-        "›◆─".encode(encoding)
-    except (LookupError, UnicodeEncodeError):
-        return False
-    return True

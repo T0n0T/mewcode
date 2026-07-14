@@ -11,7 +11,17 @@ from mewcode.runtime import ChatRuntime
 from mewcode.tools import Workspace, create_default_registry
 from mewcode.tools.defaults import DEFAULT_OUTPUT_LIMITS
 from mewcode.tools.executor import ToolExecutor
-from mewcode.tui import ChatApp, TerminalToolInteraction
+from mewcode.tui import (
+    CyberpunkChatApp,
+    PlainChatApp,
+    PlainToolInteraction,
+    TerminalMode,
+    TuiEventBridge,
+    TuiToolInteraction,
+    build_session_metadata,
+    detect_terminal_mode,
+    supports_unicode,
+)
 
 
 def main(
@@ -25,21 +35,46 @@ def main(
         config = load_config(config_path) if config_path is not None else load_config()
         provider = create_provider(config)
         registry = create_default_registry()
-        interaction = TerminalToolInteraction(
-            stdin,
-            stdout,
-            secrets=(config.api_key,),
-        )
+        input_stream = stdin if stdin is not None else sys.stdin
+        output_stream = stdout if stdout is not None else sys.stdout
+        terminal_mode = detect_terminal_mode(input_stream, output_stream)
+        bridge: TuiEventBridge | None = None
+        if terminal_mode is TerminalMode.FULLSCREEN:
+            bridge = TuiEventBridge()
+            interaction = TuiToolInteraction(
+                bridge,
+                secrets=(config.api_key,),
+            )
+        else:
+            interaction = PlainToolInteraction(
+                input_stream,
+                output_stream,
+                secrets=(config.api_key,),
+            )
+        workspace_path = Path.cwd()
         executor = ToolExecutor(
             registry,
-            Workspace(Path.cwd()),
+            Workspace(workspace_path),
             interaction,
             limits=DEFAULT_OUTPUT_LIMITS,
             secrets=(config.api_key,),
         )
         runtime = ChatRuntime(provider, registry, executor)
-        app = ChatApp(runtime, config, input_stream=stdin, output_stream=stdout)
-        return app.run()
+        if terminal_mode is TerminalMode.FULLSCREEN:
+            assert bridge is not None
+            app = CyberpunkChatApp(
+                runtime,
+                build_session_metadata(config, workspace_path),
+                bridge,
+                unicode_output=supports_unicode(output_stream),
+            )
+            return app.run() or 0
+        return PlainChatApp(
+            runtime,
+            config,
+            input_stream=input_stream,
+            output_stream=output_stream,
+        ).run()
     except MewCodeError as exc:
         error_stream.write(f"Error: {exc.user_message}\n")
         error_stream.flush()

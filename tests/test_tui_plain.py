@@ -1,11 +1,15 @@
 from io import StringIO
+from pathlib import Path
 
 import pytest
 
 from mewcode.config import LLMConfig
 from mewcode.errors import MewCodeError
-from mewcode.providers.base import ToolCall
+from mewcode.providers.base import ResponseCompleted, TextDelta, ToolCall
+from mewcode.runtime import ChatRuntime
+from mewcode.tools import Workspace, create_default_registry
 from mewcode.tools.base import ConfirmationPreview, ToolErrorInfo, ToolResult
+from mewcode.tools.executor import ToolExecutor
 from mewcode.tui.plain import PlainChatApp, PlainToolInteraction
 from mewcode.turns import (
     TurnCompleted,
@@ -179,3 +183,36 @@ def test_plain_reports_tool_budget_exhaustion():
     output = TrackingOutput()
     PlainToolInteraction(StringIO(), output).tool_budget_exhausted()
     assert "tool limit" in output.getvalue().lower()
+
+
+def test_plain_app_preserves_runtime_history_across_turns():
+    class RecordingProvider:
+        def __init__(self):
+            self.calls = []
+
+        def stream_response(self, history, tools, cancellation):
+            self.calls.append(tuple(history))
+            yield TextDelta(f"reply-{len(self.calls)}")
+            yield ResponseCompleted([])
+
+    provider = RecordingProvider()
+    registry = create_default_registry()
+    runtime = ChatRuntime(
+        provider,  # type: ignore[arg-type]
+        registry,
+        ToolExecutor(registry, Workspace(Path.cwd())),
+    )
+    app = PlainChatApp(
+        runtime,
+        config(),
+        input_stream=StringIO("one\ntwo\nexit\n"),
+        output_stream=TrackingOutput(),
+    )
+
+    assert app.run() == 0
+    assert len(provider.calls) == 2
+    assert [message.content for message in provider.calls[1]] == [
+        "one",
+        "reply-1",
+        "two",
+    ]

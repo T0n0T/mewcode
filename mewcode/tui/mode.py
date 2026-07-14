@@ -21,3 +21,14 @@ def detect_terminal_mode(
     except (AttributeError, OSError):
         return TerminalMode.PLAIN
     return TerminalMode.FULLSCREEN if interactive else TerminalMode.PLAIN
+
+
+def supports_unicode(output_stream: TextIO) -> bool:
+    encoding = getattr(output_stream, "encoding", None)
+    if not encoding:
+        return True
+    try:
+        "›◆─".encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True

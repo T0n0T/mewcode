@@ -41,7 +41,38 @@ You can also run the module directly:
 uv run python -m mewcode
 ```
 
-Exit the session with `exit`, `quit`, or Ctrl-D.
+### Terminal interface
+
+When standard input and output are both real TTYs, MewCode opens a full-screen,
+keyboard-first interface with a session header, scrollable conversation, and
+persistent multiline composer. Piped input, redirected output, and injected
+test streams automatically use plain linear output without color, animation,
+or full-screen control sequences.
+
+Fullscreen controls:
+
+- `Enter` submits the current prompt.
+- `Shift+Enter` or `Ctrl+J` inserts a newline. The composer grows to six lines.
+- `Esc` interrupts an active response. Inside a confirmation dialog, it rejects
+  the operation instead.
+- `Ctrl+C` interrupts an active response, clears a non-empty idle draft, or
+  arms exit when the idle composer is empty; press it again within two seconds
+  to exit.
+- `Ctrl+D` exits when the idle composer is empty.
+- `End` returns a conversation paused by upward scrolling to the latest output.
+- `exit` and `quit` also end the session.
+
+You may edit the next draft while a response is streaming, but `Enter` does not
+queue or steer another request. Up and Down browse prompts submitted during the
+current session when the composer is empty. Drafts, prompt history, and
+conversation state are not restored after restart.
+
+Set `NO_COLOR=1` to keep the full-screen hierarchy while removing color. MewCode
+also falls back to ASCII markers when the output encoding cannot represent its
+Unicode symbols.
+
+This version has no slash commands, command palette, model switcher, theme
+configuration, or persistent chat history.
 
 ## Configuration
 
