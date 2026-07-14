@@ -512,7 +512,7 @@
 **步骤：**
 1. 测试多个槽位的调用 ID、名称和参数增量独立拼接为 `RawToolCall` 并按 slot 排序。
 2. 缺失 ID 时使用 run ID、iteration 和 slot 生成稳定替代值。
-3. 测试重复非空调用 ID 和不稳定槽位触发协议完整性错误，不返回 `CollectedResponse`。
+3. 测试重复非空调用 ID、显式 ID 与替代 ID 碰撞，以及不稳定槽位都会触发协议完整性错误，不返回 `CollectedResponse`。
 
 **验证：** `uv run pytest tests/test_agent_collector.py -k "tool_call or fallback_id or duplicate_id"`，期望全部通过。
 
