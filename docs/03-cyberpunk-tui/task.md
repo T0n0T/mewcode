@@ -50,7 +50,7 @@
 
 ## T1：加入 TUI 依赖
 
-**文件：** `pyproject.toml`、`uv.lock`  
+**文件：** `pyproject.toml`、`uv.lock`
 **依赖：** 无
 
 **步骤：**
@@ -65,7 +65,7 @@
 
 ## T2：定义回合阶段与事件
 
-**文件：** `mewcode/turns.py`、`tests/test_turns.py`  
+**文件：** `mewcode/turns.py`、`tests/test_turns.py`
 **依赖：** T1
 
 **步骤：**
@@ -80,7 +80,7 @@
 
 ## T3：实现取消状态与幂等操作
 
-**文件：** `mewcode/turns.py`、`tests/test_turns.py`  
+**文件：** `mewcode/turns.py`、`tests/test_turns.py`
 **依赖：** T2
 
 **步骤：**
@@ -96,7 +96,7 @@
 
 ## T4：实现活动流关闭绑定
 
-**文件：** `mewcode/turns.py`、`tests/test_turns.py`  
+**文件：** `mewcode/turns.py`、`tests/test_turns.py`
 **依赖：** T3
 
 **步骤：**
@@ -113,7 +113,7 @@
 
 ## T5：更新 Provider 协议与测试替身
 
-**文件：** `mewcode/providers/base.py`、`tests/test_providers.py`、`tests/test_runtime.py`、现有假 Provider 所在测试文件  
+**文件：** `mewcode/providers/base.py`、`tests/test_providers.py`、`tests/test_runtime.py`、现有假 Provider 所在测试文件
 **依赖：** T4
 
 **步骤：**
@@ -128,7 +128,7 @@
 
 ## T6：为 OpenAI 流接入取消
 
-**文件：** `mewcode/providers/openai.py`、`tests/test_providers.py`  
+**文件：** `mewcode/providers/openai.py`、`tests/test_providers.py`
 **依赖：** T5
 
 **步骤：**
@@ -145,7 +145,7 @@
 
 ## T7：为 Anthropic 流接入取消
 
-**文件：** `mewcode/providers/anthropic.py`、`tests/test_providers.py`  
+**文件：** `mewcode/providers/anthropic.py`、`tests/test_providers.py`
 **依赖：** T5
 
 **步骤：**
@@ -162,7 +162,7 @@
 
 ## T8：让普通运行时回合输出事件
 
-**文件：** `mewcode/runtime.py`、`tests/test_runtime.py`  
+**文件：** `mewcode/runtime.py`、`tests/test_runtime.py`
 **依赖：** T6、T7
 
 **步骤：**
@@ -179,7 +179,7 @@
 
 ## T9：为工具回合输出最终阶段
 
-**文件：** `mewcode/runtime.py`、`tests/test_runtime.py`  
+**文件：** `mewcode/runtime.py`、`tests/test_runtime.py`
 **依赖：** T8
 
 **步骤：**
@@ -195,7 +195,7 @@
 
 ## T10：保护运行时中断历史
 
-**文件：** `mewcode/runtime.py`、`tests/test_runtime.py`  
+**文件：** `mewcode/runtime.py`、`tests/test_runtime.py`
 **依赖：** T9
 
 **步骤：**
@@ -211,7 +211,7 @@
 
 ## T11：运行 Provider 与运行时检查点
 
-**文件：** 本阶段已修改文件  
+**文件：** 本阶段已修改文件
 **依赖：** T10
 
 **步骤：**
@@ -226,7 +226,7 @@
 
 ## T12：把行式界面迁移为 TUI 包
 
-**文件：** `mewcode/tui.py`、`mewcode/tui/__init__.py`、`mewcode/tui/plain.py`、`mewcode/tui/widgets/__init__.py`  
+**文件：** `mewcode/tui.py`、`mewcode/tui/__init__.py`、`mewcode/tui/plain.py`、`mewcode/tui/widgets/__init__.py`
 **依赖：** T11
 
 **步骤：**
@@ -242,7 +242,7 @@
 
 ## T13：让纯文本应用消费回合事件
 
-**文件：** `mewcode/tui/plain.py`、`tests/test_tui_plain.py`  
+**文件：** `mewcode/tui/plain.py`、`tests/test_tui_plain.py`
 **依赖：** T12
 
 **步骤：**
@@ -259,7 +259,7 @@
 
 ## T14：实现终端模式检测
 
-**文件：** `mewcode/tui/mode.py`、`mewcode/tui/__init__.py`、`tests/test_tui_mode.py`  
+**文件：** `mewcode/tui/mode.py`、`mewcode/tui/__init__.py`、`tests/test_tui_mode.py`
 **依赖：** T12
 
 **步骤：**
@@ -275,7 +275,7 @@
 
 ## T15：构建安全会话元数据
 
-**文件：** `mewcode/tui/metadata.py`、`tests/test_tui_metadata.py`  
+**文件：** `mewcode/tui/metadata.py`、`tests/test_tui_metadata.py`
 **依赖：** T12
 
 **步骤：**
@@ -291,7 +291,7 @@
 
 ## T16：定义线程间界面消息
 
-**文件：** `mewcode/tui/events.py`、`tests/test_tui_app.py`  
+**文件：** `mewcode/tui/events.py`、`tests/test_tui_app.py`
 **依赖：** T1、T12
 
 **步骤：**
@@ -307,7 +307,7 @@
 
 ## T17：实现一次性绑定的 TUI Bridge
 
-**文件：** `mewcode/tui/interaction.py`、`tests/test_tui_interaction.py`  
+**文件：** `mewcode/tui/interaction.py`、`tests/test_tui_interaction.py`
 **依赖：** T16
 
 **步骤：**
@@ -323,7 +323,7 @@
 
 ## T18：实现 TUI 工具状态事件
 
-**文件：** `mewcode/tui/interaction.py`、`tests/test_tui_interaction.py`  
+**文件：** `mewcode/tui/interaction.py`、`tests/test_tui_interaction.py`
 **依赖：** T17
 
 **步骤：**
@@ -339,7 +339,7 @@
 
 ## T19：实现异步确认协调
 
-**文件：** `mewcode/tui/interaction.py`、`tests/test_tui_interaction.py`  
+**文件：** `mewcode/tui/interaction.py`、`tests/test_tui_interaction.py`
 **依赖：** T18
 
 **步骤：**
@@ -355,7 +355,7 @@
 
 ## T20：建立主题与资源加载
 
-**文件：** `mewcode/tui/cyberpunk.tcss`、`mewcode/tui/app.py`、`pyproject.toml`、`tests/test_tui_app.py`  
+**文件：** `mewcode/tui/cyberpunk.tcss`、`mewcode/tui/app.py`、`pyproject.toml`、`tests/test_tui_app.py`
 **依赖：** T1、T12
 
 **步骤：**
@@ -372,7 +372,7 @@
 
 ## T21：实现顶部栏与欢迎卡
 
-**文件：** `mewcode/tui/widgets/chrome.py`、`mewcode/tui/widgets/__init__.py`、`tests/test_tui_widgets.py`  
+**文件：** `mewcode/tui/widgets/chrome.py`、`mewcode/tui/widgets/__init__.py`、`tests/test_tui_widgets.py`
 **依赖：** T15、T20
 
 **步骤：**
@@ -388,7 +388,7 @@
 
 ## T22：实现活动与新输出提示
 
-**文件：** `mewcode/tui/widgets/chrome.py`、`tests/test_tui_widgets.py`  
+**文件：** `mewcode/tui/widgets/chrome.py`、`tests/test_tui_widgets.py`
 **依赖：** T16、T21
 
 **步骤：**
@@ -404,7 +404,7 @@
 
 ## T23：实现会话内提示历史
 
-**文件：** `mewcode/tui/widgets/composer.py`、`tests/test_tui_widgets.py`  
+**文件：** `mewcode/tui/widgets/composer.py`、`tests/test_tui_widgets.py`
 **依赖：** T20
 
 **步骤：**
@@ -420,7 +420,7 @@
 
 ## T24：实现多行 PromptComposer
 
-**文件：** `mewcode/tui/widgets/composer.py`、`mewcode/tui/widgets/__init__.py`、`tests/test_tui_widgets.py`  
+**文件：** `mewcode/tui/widgets/composer.py`、`mewcode/tui/widgets/__init__.py`、`tests/test_tui_widgets.py`
 **依赖：** T23
 
 **步骤：**
@@ -437,7 +437,7 @@
 
 ## T25：实现用户与回复消息视图
 
-**文件：** `mewcode/tui/widgets/conversation.py`、`mewcode/tui/widgets/__init__.py`、`tests/test_tui_widgets.py`  
+**文件：** `mewcode/tui/widgets/conversation.py`、`mewcode/tui/widgets/__init__.py`、`tests/test_tui_widgets.py`
 **依赖：** T20
 
 **步骤：**
@@ -453,7 +453,7 @@
 
 ## T26：接入流式 Markdown
 
-**文件：** `mewcode/tui/widgets/conversation.py`、`tests/test_tui_widgets.py`  
+**文件：** `mewcode/tui/widgets/conversation.py`、`tests/test_tui_widgets.py`
 **依赖：** T25
 
 **步骤：**
@@ -469,7 +469,7 @@
 
 ## T27：实现智能滚动
 
-**文件：** `mewcode/tui/widgets/conversation.py`、`tests/test_tui_widgets.py`  
+**文件：** `mewcode/tui/widgets/conversation.py`、`tests/test_tui_widgets.py`
 **依赖：** T22、T26
 
 **步骤：**
@@ -485,7 +485,7 @@
 
 ## T28：实现工具卡与错误卡
 
-**文件：** `mewcode/tui/widgets/conversation.py`、`tests/test_tui_widgets.py`  
+**文件：** `mewcode/tui/widgets/conversation.py`、`tests/test_tui_widgets.py`
 **依赖：** T18、T20
 
 **步骤：**
@@ -501,7 +501,7 @@
 
 ## T29：实现安全确认弹层
 
-**文件：** `mewcode/tui/widgets/confirmation.py`、`mewcode/tui/widgets/__init__.py`、`tests/test_tui_widgets.py`  
+**文件：** `mewcode/tui/widgets/confirmation.py`、`mewcode/tui/widgets/__init__.py`、`tests/test_tui_widgets.py`
 **依赖：** T19、T20
 
 **步骤：**
@@ -517,7 +517,7 @@
 
 ## T30：组装全屏应用壳
 
-**文件：** `mewcode/tui/app.py`、`mewcode/tui/__init__.py`、`tests/test_tui_app.py`  
+**文件：** `mewcode/tui/app.py`、`mewcode/tui/__init__.py`、`tests/test_tui_app.py`
 **依赖：** T21、T22、T24、T27、T28、T29
 
 **步骤：**
@@ -533,7 +533,7 @@
 
 ## T31：实现普通 TurnWorker 流程
 
-**文件：** `mewcode/tui/app.py`、`mewcode/tui/events.py`、`tests/test_tui_app.py`  
+**文件：** `mewcode/tui/app.py`、`mewcode/tui/events.py`、`tests/test_tui_app.py`
 **依赖：** T30、T10
 
 **步骤：**
@@ -550,7 +550,7 @@
 
 ## T32：实现文本批处理与顺序屏障
 
-**文件：** `mewcode/tui/app.py`、`tests/test_tui_app.py`  
+**文件：** `mewcode/tui/app.py`、`tests/test_tui_app.py`
 **依赖：** T31
 
 **步骤：**
@@ -566,7 +566,7 @@
 
 ## T33：实现工具回合界面编排
 
-**文件：** `mewcode/tui/app.py`、`tests/test_tui_app.py`  
+**文件：** `mewcode/tui/app.py`、`tests/test_tui_app.py`
 **依赖：** T28、T29、T32
 
 **步骤：**
@@ -583,7 +583,7 @@
 
 ## T34：实现界面错误边界
 
-**文件：** `mewcode/tui/app.py`、`tests/test_tui_app.py`  
+**文件：** `mewcode/tui/app.py`、`tests/test_tui_app.py`
 **依赖：** T32
 
 **步骤：**
@@ -599,7 +599,7 @@
 
 ## T35：实现中断与迟到事件过滤
 
-**文件：** `mewcode/tui/app.py`、`tests/test_tui_app.py`  
+**文件：** `mewcode/tui/app.py`、`tests/test_tui_app.py`
 **依赖：** T10、T31、T34
 
 **步骤：**
@@ -616,7 +616,7 @@
 
 ## T36：实现输入历史、草稿与退出状态机
 
-**文件：** `mewcode/tui/app.py`、`mewcode/tui/widgets/composer.py`、`tests/test_tui_app.py`  
+**文件：** `mewcode/tui/app.py`、`mewcode/tui/widgets/composer.py`、`tests/test_tui_app.py`
 **依赖：** T24、T35
 
 **步骤：**
@@ -633,7 +633,7 @@
 
 ## T37：实现响应式与能力降级
 
-**文件：** `mewcode/tui/app.py`、`mewcode/tui/plain.py`、`mewcode/tui/cyberpunk.tcss`、`tests/test_tui_app.py`、`tests/test_tui_widgets.py`  
+**文件：** `mewcode/tui/app.py`、`mewcode/tui/plain.py`、`mewcode/tui/cyberpunk.tcss`、`tests/test_tui_app.py`、`tests/test_tui_widgets.py`
 **依赖：** T30、T36
 
 **步骤：**
@@ -650,7 +650,7 @@
 
 ## T38：加入关键布局快照
 
-**文件：** `tests/test_tui_app.py`、`tests/snapshots/`  
+**文件：** `tests/test_tui_app.py`、`tests/snapshots/`
 **依赖：** T33、T34、T37
 
 **步骤：**
@@ -666,7 +666,7 @@
 
 ## T39：接入 CLI 模式装配
 
-**文件：** `mewcode/cli.py`、`mewcode/tui/__init__.py`、`tests/test_cli.py`  
+**文件：** `mewcode/cli.py`、`mewcode/tui/__init__.py`、`tests/test_cli.py`
 **依赖：** T14、T15、T19、T38
 
 **步骤：**
@@ -683,7 +683,7 @@
 
 ## T40：移除兼容入口并迁移旧测试
 
-**文件：** `mewcode/tui/__init__.py`、`tests/test_tui.py`、`tests/test_tui_plain.py`、`tests/test_cli.py`、其他受影响测试  
+**文件：** `mewcode/tui/__init__.py`、`tests/test_tui.py`、`tests/test_tui_plain.py`、`tests/test_cli.py`、其他受影响测试
 **依赖：** T39
 
 **步骤：**
@@ -699,7 +699,7 @@
 
 ## T41：更新用户文档
 
-**文件：** `README.md`  
+**文件：** `README.md`
 **依赖：** T40
 
 **步骤：**
@@ -715,7 +715,7 @@
 
 ## T42：执行完整交付验证
 
-**文件：** 全部改动文件  
+**文件：** 全部改动文件
 **依赖：** T41
 
 **步骤：**

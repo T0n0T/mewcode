@@ -47,8 +47,15 @@ Screen {
     color: $muted;
 }
 
-#session-header > #connection-status {
+#session-header > #header-workspace {
     width: 1fr;
+    overflow-x: hidden;
+    text-overflow: ellipsis;
+}
+
+#session-header > #connection-status {
+    dock: right;
+    width: auto;
     margin-right: 0;
     color: $success;
     text-align: right;

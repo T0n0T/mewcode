@@ -100,6 +100,22 @@ def test_activity_indicator_renders_each_state_and_elapsed_time():
     assert indicator.render().plain == "◆ INTERRUPTED"
 
 
+def test_activity_indicator_only_ticks_while_activity_is_running():
+    now = [20.0]
+    indicator = ActivityIndicator(clock=lambda: now[0])
+    indicator.set_activity(ActivityState.READY)
+    ready = indicator.render().plain
+    now[0] = 21.0
+    indicator._tick()
+    assert indicator.render().plain == ready
+
+    indicator.set_activity(ActivityState.UPLINKING, "model")
+    active = indicator.render().plain
+    now[0] = 22.0
+    indicator._tick()
+    assert indicator.render().plain != active
+
+
 def test_new_output_indicator_tracks_visibility_and_count():
     indicator = NewOutputIndicator()
 
@@ -304,6 +320,29 @@ async def test_conversation_freezes_and_restores_output_following():
         conversation.return_to_bottom()
         assert conversation.follow_output is True
         assert conversation.unread_output == 0
+
+
+@pytest.mark.asyncio
+async def test_frozen_conversation_stays_frozen_across_resize():
+    app = ScrollApp()
+
+    async with app.run_test(size=(40, 8)) as pilot:
+        conversation = app.query_one(ConversationView)
+        for index in range(30):
+            await conversation.append_widget(Static(f"line {index}"))
+        await pilot.pause()
+        conversation.freeze_following()
+        conversation.scroll_to(y=5, animate=False, force=True)
+        await pilot.pause()
+        previous_offset = conversation.scroll_y
+
+        await pilot.resize_terminal(44, 8)
+        await conversation.append_widget(Static("new line"))
+        await pilot.pause()
+
+        assert conversation.follow_output is False
+        assert conversation.scroll_y == previous_offset
+        assert conversation.unread_output == 1
 
 
 class CardsApp(App[None]):
