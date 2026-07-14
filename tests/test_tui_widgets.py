@@ -2,15 +2,31 @@ from pathlib import Path
 
 import pytest
 from textual.app import App, ComposeResult
-from textual.widgets import Static
+from textual.widgets import Markdown, Static
 
-from mewcode.tui.events import ActivityState
+from mewcode.tools.base import ConfirmationPreview
+from mewcode.tui.events import (
+    ActivityState,
+    ToolFinishedPayload,
+    ToolStartedPayload,
+    TruncationPresentation,
+    TurnErrorPayload,
+)
 from mewcode.tui.metadata import SessionMetadata
 from mewcode.tui.widgets.chrome import (
     ActivityIndicator,
     NewOutputIndicator,
     SessionHeader,
     WelcomeCard,
+)
+from mewcode.tui.widgets.composer import PromptComposer, PromptHistory
+from mewcode.tui.widgets.confirmation import ConfirmationModal
+from mewcode.tui.widgets.conversation import (
+    AssistantMessageView,
+    ConversationView,
+    ErrorCard,
+    ToolCard,
+    UserMessageView,
 )
 
 
@@ -93,3 +109,247 @@ def test_new_output_indicator_tracks_visibility_and_count():
     assert str(indicator.label) == "NEW OUTPUT (3) ↓"
     indicator.set_count(0)
     assert indicator.display is False
+
+
+def test_prompt_history_preserves_draft_and_navigation_boundaries():
+    history = PromptHistory()
+    history.record("first")
+    history.record("second\nline")
+
+    assert history.previous("current draft") == "second\nline"
+    assert history.previous("ignored") == "first"
+    assert history.previous("ignored") == "first"
+    assert history.next() == "second\nline"
+    assert history.next() == "current draft"
+    assert history.next() == "current draft"
+
+
+def test_prompt_history_ignores_blank_and_allows_repeated_entries():
+    history = PromptHistory()
+    history.record("   ")
+    history.record("same")
+    history.record("same")
+
+    assert history.entries == ("same", "same")
+    assert history.previous("draft") == "same"
+    history.reset_navigation()
+    assert history.next() == ""
+
+
+class ComposerApp(App[None]):
+    def __init__(self):
+        super().__init__()
+        self.submissions = []
+
+    def compose(self) -> ComposeResult:
+        yield PromptComposer()
+
+    def on_prompt_composer_submitted(
+        self,
+        event: PromptComposer.Submitted,
+    ) -> None:
+        self.submissions.append(event.prompt)
+
+
+@pytest.mark.asyncio
+async def test_composer_submits_and_keeps_multiline_input_as_one_prompt():
+    app = ComposerApp()
+
+    async with app.run_test() as pilot:
+        composer = app.query_one(PromptComposer)
+        composer.focus()
+        await pilot.press("h", "i", "shift+enter", "x")
+        assert composer.text == "hi\nx"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.submissions == ["hi\nx"]
+
+
+@pytest.mark.asyncio
+async def test_composer_busy_state_preserves_draft_and_suppresses_submit():
+    app = ComposerApp()
+
+    async with app.run_test() as pilot:
+        composer = app.query_one(PromptComposer)
+        composer.focus()
+        composer.insert("next task\nwith details")
+        composer.set_busy(True)
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.submissions == []
+        assert composer.text == "next task\nwith details"
+        assert composer.styles.height.value == 2
+
+
+@pytest.mark.asyncio
+async def test_composer_navigates_history_only_from_empty_or_history_state():
+    app = ComposerApp()
+
+    async with app.run_test() as pilot:
+        composer = app.query_one(PromptComposer)
+        composer.prompt_history.record("first")
+        composer.prompt_history.record("second")
+        composer.focus()
+
+        await pilot.press("up")
+        assert composer.text == "second"
+        await pilot.press("up")
+        assert composer.text == "first"
+        await pilot.press("down")
+        assert composer.text == "second"
+        await pilot.press("down")
+        assert composer.text == ""
+
+
+class ConversationWidgetsApp(App[None]):
+    def compose(self) -> ComposeResult:
+        yield UserMessageView("hello")
+        yield UserMessageView("ascii", unicode=False)
+        yield AssistantMessageView()
+
+
+@pytest.mark.asyncio
+async def test_message_views_use_visual_anchors_without_role_label():
+    app = ConversationWidgetsApp()
+
+    async with app.run_test():
+        users = list(app.query(UserMessageView))
+        assistant = app.query_one(AssistantMessageView)
+        assert users[0].render().plain == "› hello"
+        assert users[1].render().plain == "> ascii"
+        assert assistant.query_one(".message-marker", Static).render().plain == "◆"
+        assert "assistant" not in app.export_screenshot().lower()
+
+
+@pytest.mark.asyncio
+async def test_assistant_message_streams_markdown_and_marks_interruption():
+    app = ConversationWidgetsApp()
+
+    async with app.run_test() as pilot:
+        assistant = app.query_one(AssistantMessageView)
+        await assistant.append_markdown("# Head")
+        await assistant.append_markdown(
+            "ing\n\n- item\n\n```python\nprint('x')\n```"
+        )
+        await pilot.pause()
+        markdown = assistant.query_one(Markdown)
+        assert markdown.source == (
+            "# Heading\n\n- item\n\n```python\nprint('x')\n```"
+        )
+
+        await assistant.mark_interrupted()
+        await pilot.pause()
+        assert assistant.query_one(".interrupted", Static).render().plain == "INTERRUPTED"
+
+
+class ScrollApp(App[None]):
+    def compose(self) -> ComposeResult:
+        yield ConversationView()
+
+
+@pytest.mark.asyncio
+async def test_conversation_freezes_and_restores_output_following():
+    app = ScrollApp()
+
+    async with app.run_test(size=(40, 8)):
+        conversation = app.query_one(ConversationView)
+        for index in range(20):
+            await conversation.append_widget(Static(f"line {index}"))
+
+        conversation.freeze_following()
+        previous_offset = conversation.scroll_y
+        await conversation.append_widget(Static("new line"))
+        assert conversation.follow_output is False
+        assert conversation.unread_output == 1
+        assert conversation.scroll_y == previous_offset
+
+        conversation.return_to_bottom()
+        assert conversation.follow_output is True
+        assert conversation.unread_output == 0
+
+
+class CardsApp(App[None]):
+    def compose(self) -> ComposeResult:
+        yield ToolCard(
+            ToolStartedPayload(
+                1,
+                "call-1",
+                "read_file",
+                "path=README.md",
+                1.0,
+            )
+        )
+        yield ErrorCard(
+            TurnErrorPayload(1, "Network unavailable", "safe technical detail")
+        )
+
+
+@pytest.mark.asyncio
+async def test_tool_card_updates_in_place_and_error_details_stay_collapsed():
+    app = CardsApp()
+
+    async with app.run_test():
+        card = app.query_one(ToolCard)
+        assert card.collapsed is True
+        assert "EXECUTING read_file" in str(card.title)
+
+        card.finish(
+            ToolFinishedPayload(
+                1,
+                "call-1",
+                "read_file",
+                "error",
+                9,
+                "file missing",
+                TruncationPresentation(
+                    "characters",
+                    100,
+                    10,
+                    "narrow the read",
+                ),
+            )
+        )
+        assert "ERROR read_file · 9ms" in str(card.title)
+        assert "status-error" in card.classes
+        assert app.query_one(ErrorCard).collapsed is True
+        assert "Network unavailable" in str(app.query_one(ErrorCard).title)
+
+
+class ModalApp(App[None]):
+    def __init__(self):
+        super().__init__()
+        self.result: bool | None = None
+
+    def on_mount(self) -> None:
+        self.push_screen(
+            ConfirmationModal(
+                ConfirmationPreview(
+                    "command",
+                    "Run command",
+                    "echo hello",
+                )
+            ),
+            self._record,
+        )
+
+    def _record(self, result: bool) -> None:
+        self.result = result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [("escape", False), ("n", False), ("y", True)],
+)
+async def test_confirmation_modal_has_safe_keyboard_decisions(key, expected):
+    app = ModalApp()
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        if expected is False:
+            assert app.screen.query_one("#reject").has_focus is True
+        await pilot.press(key)
+        await pilot.pause()
+        assert app.result is expected
