@@ -17,7 +17,9 @@ from mewcode.tools.base import (
 )
 
 
-def _schema(properties: dict[str, JSONValue], required: list[str]) -> dict[str, JSONValue]:
+def _schema(
+    properties: dict[str, JSONValue], required: list[str]
+) -> dict[str, JSONValue]:
     return {
         "type": "object",
         "properties": properties,
@@ -27,7 +29,11 @@ def _schema(properties: dict[str, JSONValue], required: list[str]) -> dict[str, 
 
 
 def _validate_pattern(pattern: str) -> None:
-    if not pattern or pattern.startswith("/") or ".." in pattern.replace("\\", "/").split("/"):
+    if (
+        not pattern
+        or pattern.startswith("/")
+        or ".." in pattern.replace("\\", "/").split("/")
+    ):
         raise ToolInputError(
             "invalid_path_pattern",
             "Path patterns must be non-empty workspace-relative patterns without '..'.",
@@ -107,7 +113,9 @@ class SearchCodeTool:
             try:
                 compiled = re.compile(query)
             except re.error as exc:
-                raise ToolInputError("invalid_regex", f"Invalid regular expression: {exc}") from exc
+                raise ToolInputError(
+                    "invalid_regex", f"Invalid regular expression: {exc}"
+                ) from exc
         return PreparedToolAction(dict(arguments), None, compiled)
 
     async def execute(
@@ -115,7 +123,9 @@ class SearchCodeTool:
     ) -> ToolResult:
         query = str(action.arguments["query"])
         path_pattern_value = action.arguments.get("path_pattern")
-        path_pattern = str(path_pattern_value) if path_pattern_value is not None else None
+        path_pattern = (
+            str(path_pattern_value) if path_pattern_value is not None else None
+        )
         compiled = action.state if isinstance(action.state, re.Pattern) else None
         matches: list[dict[str, JSONValue]] = []
         skipped_binary = 0
@@ -147,7 +157,11 @@ class SearchCodeTool:
             for line_number, line in enumerate(text.splitlines(), start=1):
                 context.deadline.check()
                 context.cancellation.raise_if_cancelled()
-                found = compiled.search(line) is not None if compiled is not None else query in line
+                found = (
+                    compiled.search(line) is not None
+                    if compiled is not None
+                    else query in line
+                )
                 if found:
                     matches.append(
                         {"path": relative, "line": line_number, "content": line}
@@ -181,6 +195,8 @@ def _match_segments(path: list[str], pattern: list[str]) -> bool:
         return _match_segments(path, pattern[1:]) or (
             bool(path) and _match_segments(path[1:], pattern)
         )
-    return bool(path) and fnmatch.fnmatchcase(path[0], pattern[0]) and _match_segments(
-        path[1:], pattern[1:]
+    return (
+        bool(path)
+        and fnmatch.fnmatchcase(path[0], pattern[0])
+        and _match_segments(path[1:], pattern[1:])
     )

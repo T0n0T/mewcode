@@ -86,7 +86,11 @@ class ReadFileTool:
                 "invalid_line_range",
                 f"start_line {start_line} is beyond the file's {total_lines} lines.",
             )
-        end_index = total_lines if line_count_value is None else start_line - 1 + int(line_count_value)
+        end_index = (
+            total_lines
+            if line_count_value is None
+            else start_line - 1 + int(line_count_value)
+        )
         selected = lines[start_line - 1 : end_index]
         end_line = start_line + len(selected) - 1 if selected else 0
         return ToolResult(
@@ -132,7 +136,9 @@ class WriteFileTool:
         preview = ConfirmationPreview(
             kind="write",
             title=f"Write {relative}",
-            details=_unified_diff(relative, original or "", new_content, is_new=original is None),
+            details=_unified_diff(
+                relative, original or "", new_content, is_new=original is None
+            ),
         )
         state = _FileState(path, original, _fingerprint(original), new_content)
         return PreparedToolAction(dict(arguments), preview, state)
@@ -185,7 +191,9 @@ class EditFileTool:
         old_text = str(arguments["old_text"])
         count = original.count(old_text)
         if count == 0:
-            raise ToolInputError("text_not_found", "old_text was not found in the file.")
+            raise ToolInputError(
+                "text_not_found", "old_text was not found in the file."
+            )
         if count != 1:
             raise ToolInputError(
                 "text_not_unique",
@@ -265,24 +273,24 @@ def _read_optional_utf8_sync(path: Path, context: ToolContext) -> str | None:
     if not path.exists():
         return None
     if not path.is_file():
-        raise WorkspacePathError(f"Path is not a regular file: {path}", code="not_a_file")
+        raise WorkspacePathError(
+            f"Path is not a regular file: {path}", code="not_a_file"
+        )
     return _read_utf8_sync(path, context)
 
 
-async def _read_optional_utf8_safely(
-    context: ToolContext, relative: str
-) -> str | None:
+async def _read_optional_utf8_safely(context: ToolContext, relative: str) -> str | None:
     return await asyncio.to_thread(_read_optional_utf8_safely_sync, context, relative)
 
 
-def _read_optional_utf8_safely_sync(
-    context: ToolContext, relative: str
-) -> str | None:
+def _read_optional_utf8_safely_sync(context: ToolContext, relative: str) -> str | None:
     context.cancellation.raise_if_cancelled()
     context.deadline.check()
     parts = Path(relative).parts
     try:
-        parent_fd = _open_parent_directory(context.workspace.root, parts[:-1], create=False)
+        parent_fd = _open_parent_directory(
+            context.workspace.root, parts[:-1], create=False
+        )
     except FileNotFoundError:
         return None
     try:
@@ -330,7 +338,9 @@ def _unified_diff(relative: str, old: str, new: str, *, is_new: bool = False) ->
 
 
 async def _atomic_write(path: Path, content: str, context: ToolContext) -> None:
-    task = asyncio.create_task(asyncio.to_thread(_atomic_write_sync, path, content, context))
+    task = asyncio.create_task(
+        asyncio.to_thread(_atomic_write_sync, path, content, context)
+    )
     try:
         await asyncio.shield(task)
     except asyncio.CancelledError:

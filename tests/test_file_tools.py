@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from pathlib import Path
 
 import pytest
@@ -59,7 +60,9 @@ async def test_read_file_success_and_ignored_file(tmp_path: Path):
     result = await execute(
         tmp_path,
         ReadFileTool(),
-        ToolCall("1", "read_file", {"path": "ignored.txt", "start_line": 2, "line_count": 1})
+        ToolCall(
+            "1", "read_file", {"path": "ignored.txt", "start_line": 2, "line_count": 1}
+        ),
     )
 
     assert result.status == "success"
@@ -72,9 +75,7 @@ async def test_read_file_success_and_ignored_file(tmp_path: Path):
 async def test_read_file_error_and_truncated(tmp_path: Path, content: bytes):
     (tmp_path / "bad.txt").write_bytes(content)
     result = await execute(
-        tmp_path,
-        ReadFileTool(),
-        ToolCall("1", "read_file", {"path": "bad.txt"})
+        tmp_path, ReadFileTool(), ToolCall("1", "read_file", {"path": "bad.txt"})
     )
 
     assert result.status == "error"
@@ -152,7 +153,9 @@ async def test_write_file_conflict_keeps_external_change(tmp_path: Path):
     action = await tool.prepare({"path": "file.txt", "content": "new"}, context)
     target.write_text("changed", encoding="utf-8")
 
-    result = await execute(tmp_path, tool, ToolCall("1", "write_file", action.arguments))
+    result = await execute(
+        tmp_path, tool, ToolCall("1", "write_file", action.arguments)
+    )
     # Executor prepares a fresh action, so directly execute stale action to verify the guard.
     with pytest.raises(Exception, match="changed after the preview"):
         await tool.execute(action, context)
@@ -211,7 +214,11 @@ async def test_atomic_write_cleans_temporary_file_on_replace_failure(
     context = _context(Workspace(tmp_path))
     action = await tool.prepare({"path": "file.txt", "content": "new"}, context)
 
-    monkeypatch.setattr(file_tools.os, "replace", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("replace failed")))
+    monkeypatch.setattr(
+        file_tools.os,
+        "replace",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("replace failed")),
+    )
     with pytest.raises(OSError, match="replace failed"):
         await tool.execute(action, context)
 
@@ -221,25 +228,45 @@ async def test_atomic_write_cleans_temporary_file_on_replace_failure(
 
 @pytest.mark.asyncio
 async def test_write_file_cancellation_leaves_old_or_complete_new_content(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ):
+    import mewcode.tools.file_tools as file_tools
+
     target = tmp_path / "file.txt"
     target.write_text("old", encoding="utf-8")
     token = CancellationToken()
     tool = WriteFileTool()
     context = _context(Workspace(tmp_path), token)
-    action = await tool.prepare(
-        {"path": "file.txt", "content": "new" * 100_000}, context
-    )
+    new_content = "new" * 100_000
+    action = await tool.prepare({"path": "file.txt", "content": new_content}, context)
+    replace_started = threading.Event()
+    allow_replace = threading.Event()
+    original_replace = file_tools.os.replace
+
+    def controlled_replace(*args, **kwargs):
+        replace_started.set()
+        if not allow_replace.wait(timeout=5):
+            raise TimeoutError("test did not release atomic replace")
+        return original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(file_tools.os, "replace", controlled_replace)
 
     task = asyncio.create_task(tool.execute(action, context))
-    await asyncio.sleep(0)
-    token.cancel()
-    task.cancel()
+    assert await asyncio.to_thread(replace_started.wait, 5)
+    try:
+        token.cancel()
+        task.cancel()
+        await asyncio.sleep(0)
+
+        assert not task.done()
+        assert target.read_text(encoding="utf-8") == "old"
+    finally:
+        allow_replace.set()
+
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert target.read_text(encoding="utf-8") in {"old", "new" * 100_000}
+    assert target.read_text(encoding="utf-8") == new_content
     assert list(tmp_path.glob(".file.txt.*.tmp")) == []
 
 
@@ -252,7 +279,11 @@ async def test_edit_file_success_not_found_not_unique_and_conflict(tmp_path: Pat
     result = await execute(
         tmp_path,
         EditFileTool(),
-        ToolCall("1", "edit_file", {"path": "file.txt", "old_text": "two", "new_text": "three"}),
+        ToolCall(
+            "1",
+            "edit_file",
+            {"path": "file.txt", "old_text": "two", "new_text": "three"},
+        ),
         interaction,
     )
     assert result.status == "success"
@@ -262,7 +293,11 @@ async def test_edit_file_success_not_found_not_unique_and_conflict(tmp_path: Pat
     not_found = await execute(
         tmp_path,
         EditFileTool(),
-        ToolCall("2", "edit_file", {"path": "file.txt", "old_text": "absent", "new_text": "x"})
+        ToolCall(
+            "2",
+            "edit_file",
+            {"path": "file.txt", "old_text": "absent", "new_text": "x"},
+        ),
     )
     assert not_found.error.code == "text_not_found"
 
@@ -270,7 +305,9 @@ async def test_edit_file_success_not_found_not_unique_and_conflict(tmp_path: Pat
     not_unique = await execute(
         tmp_path,
         EditFileTool(),
-        ToolCall("3", "edit_file", {"path": "file.txt", "old_text": "x", "new_text": "y"})
+        ToolCall(
+            "3", "edit_file", {"path": "file.txt", "old_text": "x", "new_text": "y"}
+        ),
     )
     assert not_unique.error.code == "text_not_unique"
 

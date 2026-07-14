@@ -101,7 +101,9 @@ async def test_timeout_validation_and_encoding(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_command_can_use_timeout_longer_than_ordinary_tool_deadline(tmp_path: Path):
+async def test_command_can_use_timeout_longer_than_ordinary_tool_deadline(
+    tmp_path: Path,
+):
     class Process:
         returncode = 0
         pid = 123

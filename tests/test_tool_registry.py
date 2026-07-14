@@ -203,7 +203,11 @@ def test_register_rejects_empty_and_duplicate_names():
     "schema",
     [
         {"type": "string", "additionalProperties": False},
-        {"type": "object", "properties": {"x": {"type": "not-a-type"}}, "additionalProperties": False},
+        {
+            "type": "object",
+            "properties": {"x": {"type": "not-a-type"}},
+            "additionalProperties": False,
+        },
         {"type": "object", "properties": {}},
     ],
 )
