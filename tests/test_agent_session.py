@@ -344,6 +344,24 @@ async def test_consumer_close_break_cancels_run_cleans_up_and_allows_follow_up(
 
 
 @pytest.mark.asyncio
+async def test_consumer_close_before_iteration_cleans_up_and_allows_follow_up(
+    tmp_path: Path,
+):
+    provider = ScriptedProvider([completed("follow-up complete")])
+    session = build_session(tmp_path, provider)
+    run = await session.start("first")
+    iterator = aiter(run)
+
+    await iterator.aclose()
+    await run.wait_closed()
+
+    assert provider.calls == []
+    assert session.history == (UserMessage("first"),)
+    follow_up = await consume(await session.start("second"))
+    assert follow_up[-1].reason is StopReason.COMPLETED
+
+
+@pytest.mark.asyncio
 async def test_plan_replace_and_preserve_only_after_success_uses_read_only_tools(
     tmp_path: Path,
 ):

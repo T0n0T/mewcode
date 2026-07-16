@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import suppress
 from uuid import uuid4
 
 from mewcode.agent.collector import ResponseCollector
-from mewcode.agent.control import ConfirmationBroker, EventChannel
+from mewcode.agent.control import ConfirmationBroker, EventChannel, _EventStream
 from mewcode.agent.events import (
     AgentEvent,
     ConfirmationRequested,
@@ -56,6 +56,30 @@ def _hidden_presentation(
     name: str, _arguments: Mapping[str, JSONValue]
 ) -> ToolPresentation:
     return ToolPresentation(name[:80], "<arguments hidden>")
+
+
+async def _iterate_events(stream: _EventStream):
+    try:
+        async for event in stream:
+            yield event
+    finally:
+        await stream.aclose()
+
+
+class _RunEventIterator(AsyncIterator[AgentEvent]):
+    def __init__(self, stream: _EventStream) -> None:
+        self._stream = stream
+        self._iterator = _iterate_events(stream)
+
+    def __aiter__(self) -> _RunEventIterator:
+        return self
+
+    async def __anext__(self) -> AgentEvent:
+        return await anext(self._iterator)
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+        await self._iterator.aclose()
 
 
 class AgentRun:
@@ -113,16 +137,7 @@ class AgentRun:
         return self._request.mode
 
     def __aiter__(self):
-        stream = self._events.events()
-
-        async def iterate():
-            try:
-                async for event in stream:
-                    yield event
-            finally:
-                await stream.aclose()
-
-        return iterate()
+        return _RunEventIterator(self._events.events())
 
     async def cancel(self) -> None:
         self._cancellation.cancel()

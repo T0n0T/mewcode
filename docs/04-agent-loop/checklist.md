@@ -4,11 +4,11 @@
 
 ## 验收实录（2026-07-16）
 
-- C01–C24、C26、C29–C34：Agent 核心与会话验收通过，`76 passed`；其中 Plan Mode 点名隐藏写工具已实测回写 `unknown_tool` 且零执行，立即取消与消费者提前退出均释放 Session，计划/执行在取消、Provider 错误、未知工具与 10 轮上限后均按规格保留或可重试。
+- C01–C24、C26、C29–C34：Agent 核心与会话验收通过，`77 passed`；其中 Plan Mode 点名隐藏写工具已实测回写 `unknown_tool` 且零执行，立即取消、消费者提前退出及首次迭代前显式关闭均释放 Session，计划/执行在取消、Provider 错误、未知工具与 10 轮上限后均按规格保留或可重试。
 - C25、C27、C28、C35、C44：Provider/工具/工作区回归 `79 passed`，TUI/CLI/配置回归 `78 passed`；4 张 Textual 快照通过，配置与依赖文件无功能差异。
 - C36–C38：异步界面与遗留入口扫描通过；`ChatRuntime|TurnCancellation|TurnPhaseChanged|ToolInteraction|TuiEventBridge|call_from_thread|thread=True` 无匹配。
-- C39：清单指定的 Agent、Provider、工具和 TUI 聚焦集 `130 passed`，4 张快照通过。
-- C40：`uv run pytest` 实际结果 `233 passed`，4 张快照通过。
+- C39：清单指定的 Agent、Provider、工具和 TUI 聚焦集 `131 passed`，4 张快照通过。
+- C40：`uv run pytest` 实际结果 `234 passed`，4 张快照通过。
 - C41：`uv run python -m compileall mewcode tests` 返回 0，无编译错误。
 - C42：`uv lock --check` 返回 0；`pyproject.toml`、`uv.lock` 无本里程碑功能差异。
 - C43：从空临时 cwd 与空 HOME 启动模块入口和 console script，二者均只显示缺失配置错误、实际退出码 1、无堆栈。
