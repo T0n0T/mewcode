@@ -8,8 +8,8 @@ from textual.containers import Horizontal
 from textual.message import Message
 from textual.widgets import Button, Static
 
-from mewcode.tui.events import ActivityState
 from mewcode.tui.metadata import SessionMetadata
+from mewcode.tui.presentation import ActivityState
 
 
 class SessionFooter(Horizontal):
@@ -66,7 +66,9 @@ class ActivityIndicator(Static):
         {
             ActivityState.UPLINKING,
             ActivityState.EXECUTING,
+            ActivityState.CONFIRMING,
             ActivityState.SYNTHESIZING,
+            ActivityState.STOPPING,
         }
     )
     _LABELS = {
@@ -74,7 +76,9 @@ class ActivityIndicator(Static):
         ActivityState.UPLINKING: "UPLINKING",
         ActivityState.STREAMING: "STREAMING",
         ActivityState.EXECUTING: "EXECUTING",
+        ActivityState.CONFIRMING: "CONFIRMING",
         ActivityState.SYNTHESIZING: "SYNTHESIZING",
+        ActivityState.STOPPING: "STOPPING",
         ActivityState.INTERRUPTED: "INTERRUPTED",
         ActivityState.ERROR: "ERROR",
     }

@@ -4,15 +4,26 @@ import pytest
 from textual.app import App, ComposeResult
 from textual.widgets import Collapsible, Markdown, Static
 
-from mewcode.tools.base import ConfirmationPreview
-from mewcode.tui.events import (
-    ActivityState,
-    ToolFinishedPayload,
-    ToolStartedPayload,
-    TruncationPresentation,
-    TurnErrorPayload,
+from mewcode.agent.events import (
+    EventContext,
+    ProgressChanged,
+    RunStopped,
+    ToolFinished,
+    ToolStarted,
+)
+from mewcode.agent.types import RunPhase, StopReason
+from mewcode.tools.base import (
+    ConfirmationPreview,
+    ToolExecutionPolicy,
+    TruncationInfo,
 )
 from mewcode.tui.metadata import SessionMetadata
+from mewcode.tui.presentation import (
+    ActivityState,
+    ErrorPresentation,
+    activity_for_progress,
+    error_for_stop,
+)
 from mewcode.tui.widgets.chrome import (
     ActivityIndicator,
     NewOutputIndicator,
@@ -38,6 +49,30 @@ def metadata(branch="main"):
         workspace=Path("/workspace/project"),
         git_branch=branch,
     )
+
+
+def test_presentation_maps_progress_and_hides_internal_error_details():
+    progress = ProgressChanged(
+        EventContext("run-1", 1, 2),
+        RunPhase.WAITING_CONFIRMATION,
+        2,
+        10,
+    )
+    state, detail = activity_for_progress(progress)
+    error = error_for_stop(
+        RunStopped(
+            EventContext("run-1", 2, 2),
+            StopReason.INTERNAL_ERROR,
+            "internal sk-test-secret traceback",
+            "internal_error",
+        )
+    )
+
+    assert state is ActivityState.CONFIRMING
+    assert detail == "round 2/10"
+    assert error is not None
+    assert "sk-test-secret" not in repr(error)
+    assert error.technical_detail == "internal_error"
 
 
 class ChromeApp(App[None]):
@@ -133,12 +168,22 @@ def test_ascii_widget_variants_use_only_ascii_presentation_glyphs():
     new_output = NewOutputIndicator(unicode=False)
     new_output.set_count(2)
     tool = ToolCard(
-        ToolStartedPayload(1, "call-1", "read_file", "path=README.md", 1.0),
+        ToolStarted(
+            EventContext("run-1", 1, 1),
+            "batch-1",
+            0,
+            "call-1",
+            "read_file",
+            ToolExecutionPolicy.PARALLEL_SAFE,
+            "path=README.md",
+        ),
         unicode=False,
     )
     tool.finish(
-        ToolFinishedPayload(
-            1,
+        ToolFinished(
+            EventContext("run-1", 2, 1),
+            "batch-1",
+            0,
             "call-1",
             "read_file",
             "success",
@@ -148,7 +193,7 @@ def test_ascii_widget_variants_use_only_ascii_presentation_glyphs():
         )
     )
     error = ErrorCard(
-        TurnErrorPayload(1, "Network unavailable"),
+        ErrorPresentation("Network unavailable"),
         unicode=False,
     )
 
@@ -389,16 +434,18 @@ async def test_moving_away_from_bottom_freezes_following():
 class CardsApp(App[None]):
     def compose(self) -> ComposeResult:
         yield ToolCard(
-            ToolStartedPayload(
-                1,
+            ToolStarted(
+                EventContext("run-1", 1, 1),
+                "batch-1",
+                0,
                 "call-1",
                 "read_file",
+                ToolExecutionPolicy.PARALLEL_SAFE,
                 "path=README.md",
-                1.0,
             )
         )
         yield ErrorCard(
-            TurnErrorPayload(1, "Network unavailable", "safe technical detail")
+            ErrorPresentation("Network unavailable", "safe technical detail")
         )
 
 
@@ -412,14 +459,16 @@ async def test_tool_card_updates_in_place_and_error_details_stay_collapsed():
         assert "EXECUTING read_file" in str(card.title)
 
         card.finish(
-            ToolFinishedPayload(
-                1,
+            ToolFinished(
+                EventContext("run-1", 2, 1),
+                "batch-1",
+                0,
                 "call-1",
                 "read_file",
                 "error",
                 9,
                 "file missing",
-                TruncationPresentation(
+                TruncationInfo(
                     "characters",
                     100,
                     10,

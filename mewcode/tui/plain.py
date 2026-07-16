@@ -1,22 +1,29 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from typing import TextIO
 
+from mewcode.agent import (
+    AgentSession,
+    ConfirmationRequested,
+    ConfirmationResolved,
+    ProgressChanged,
+    RunStarted,
+    RunStopped,
+    TextDeltaEvent,
+    ToolFinished,
+    ToolStarted,
+    UsageReported,
+)
 from mewcode.config import LLMConfig
-from mewcode.errors import MewCodeError, redact_secrets
-from mewcode.providers.base import ToolCall
-from mewcode.runtime import ChatRuntime
-from mewcode.tools.base import ConfirmationPreview, JSONValue, ToolResult
-from mewcode.tui.events import DEFAULT_ERROR_SUGGESTION
+from mewcode.errors import MewCodeError
 from mewcode.tui.mode import supports_unicode
-from mewcode.turns import (
-    TurnCancellation,
-    TurnCompleted,
-    TurnInterrupted,
-    TurnPhase,
-    TurnPhaseChanged,
-    TurnTextDelta,
+from mewcode.tui.presentation import (
+    activity_for_progress,
+    error_for_stop,
+    stop_label,
+    usage_text,
 )
 
 EXIT_COMMANDS = {"exit", "quit"}
@@ -26,80 +33,29 @@ CAT_BANNER = r""" /\_/\
  > ^ <"""
 
 
-class PlainToolInteraction:
-    def __init__(
-        self,
-        input_stream: TextIO | None = None,
-        output_stream: TextIO | None = None,
-        *,
-        secrets: tuple[str, ...] = (),
-    ):
-        self.input_stream = input_stream or sys.stdin
-        self.output_stream = output_stream or sys.stdout
-        self.secrets = secrets
-
-    def tool_started(self, call: ToolCall) -> None:
-        summary = argument_summary(call.arguments, self.secrets)
-        suffix = f" ({summary})" if summary else ""
-        self._write(f"   [EXECUTING {call.name}]{suffix}\n")
-
-    def confirm(self, preview: ConfirmationPreview) -> bool:
-        title = redact_secrets(preview.title, self.secrets)
-        details = redact_secrets(preview.details, self.secrets)
-        self._write(f"\n{title}\n{details}\nApprove? [y/N] ")
-        answer = self.input_stream.readline()
-        return answer.strip().lower() in {"y", "yes"}
-
-    def tool_finished(self, call: ToolCall, result: ToolResult) -> None:
-        if result.error is None:
-            detail = result.status
-        else:
-            message = redact_secrets(result.error.message, self.secrets)
-            detail = f"{result.status}: {message}"
-        self._write(f"   [TOOL {call.name}] {detail}\n")
-
-    def tool_budget_exhausted(self) -> None:
-        self._write("   [TOOL LIMIT] Additional request was not executed.\n")
-
-    def _write(self, text: str) -> None:
-        self.output_stream.write(text)
-        self.output_stream.flush()
-
-
-def argument_summary(
-    arguments: dict[str, JSONValue],
-    secrets: tuple[str, ...],
-) -> str:
-    visible_keys = ("path", "pattern", "query", "command")
-    parts: list[str] = []
-    for key in visible_keys:
-        value = arguments.get(key)
-        if isinstance(value, str):
-            parts.append(f"{key}={redact_secrets(value, secrets)}")
-    return ", ".join(parts)
-
-
 class PlainChatApp:
     def __init__(
         self,
-        runtime: ChatRuntime,
+        session: AgentSession,
         config: LLMConfig,
         input_stream: TextIO | None = None,
         output_stream: TextIO | None = None,
-    ):
-        self.runtime = runtime
+    ) -> None:
+        self.session = session
         self.config = config
         self.input_stream = input_stream or sys.stdin
         self.output_stream = output_stream or sys.stdout
+        self._threaded_input = input_stream is None
+        self._threaded_output = output_stream is None
         unicode_output = supports_unicode(self.output_stream)
         self.user_marker = "›" if unicode_output else ">"
         self.mewcode_marker = "◆" if unicode_output else "*"
 
-    def run(self) -> int:
-        self._write_header()
+    async def run(self) -> int:
+        await self._write_header()
 
         while True:
-            line = self.input_stream.readline()
+            line = await self._readline()
             if line == "":
                 return 0
 
@@ -107,52 +63,115 @@ class PlainChatApp:
             if not user_text.strip():
                 continue
             if user_text.strip().lower() in EXIT_COMMANDS:
-                self._write("Bye.\n")
+                await self._write("Bye.\n")
                 return 0
 
-            self._write(f"\n{self.user_marker} {user_text}\n")
-            cancellation = TurnCancellation()
+            await self._write(f"\n{self.user_marker} {user_text}\n")
+            try:
+                run = await self.session.start(user_text)
+            except MewCodeError as exc:
+                await self._write(f"ERROR: {exc.user_message}\n")
+                continue
+
             response_started = False
             try:
-                for event in self.runtime.stream_turn(user_text, cancellation):
-                    if isinstance(event, TurnPhaseChanged):
-                        if response_started:
-                            self._write("\n")
-                            response_started = False
-                        label = (
-                            f"UPLINKING {self.config.model}"
-                            if event.phase is TurnPhase.INITIAL_RESPONSE
-                            else "SYNTHESIZING"
+                async for event in run:
+                    if isinstance(event, RunStarted):
+                        await self._write(
+                            f"{self.mewcode_marker} [{event.mode.value.upper()}]\n"
                         )
-                        self._write(f"{self.mewcode_marker} [{label}]\n")
-                    elif isinstance(event, TurnTextDelta):
+                    elif isinstance(event, ProgressChanged):
+                        if response_started:
+                            await self._write("\n")
+                            response_started = False
+                        state, detail = activity_for_progress(event)
+                        await self._write(
+                            f"{self.mewcode_marker} "
+                            f"[{state.value.upper()} {detail}]\n"
+                        )
+                    elif isinstance(event, TextDeltaEvent):
                         if not response_started:
-                            self._write(f"{self.mewcode_marker} ")
+                            await self._write(f"{self.mewcode_marker} ")
                             response_started = True
-                        self._write(event.text)
-                    elif isinstance(event, TurnCompleted) and response_started:
-                        self._write("\n")
-                        response_started = False
-            except TurnInterrupted:
-                if response_started:
-                    self._write("\n")
-                self._write(f"{self.mewcode_marker} [INTERRUPTED]\n")
-            except MewCodeError as exc:
-                if response_started:
-                    self._write("\n")
-                self._write(f"ERROR: {exc.user_message}\n")
-                self._write(f"NEXT: {DEFAULT_ERROR_SUGGESTION}\n")
+                        await self._write(event.text)
+                    elif isinstance(event, ToolStarted):
+                        if response_started:
+                            await self._write("\n")
+                            response_started = False
+                        suffix = (
+                            f" ({event.argument_summary})"
+                            if event.argument_summary
+                            else ""
+                        )
+                        await self._write(
+                            f"   [EXECUTING {event.name}]{suffix}\n"
+                        )
+                    elif isinstance(event, ToolFinished):
+                        detail = event.status
+                        if event.error_message:
+                            detail = f"{detail}: {event.error_message}"
+                        await self._write(
+                            f"   [TOOL {event.name}] {detail} "
+                            f"({event.duration_ms}ms)\n"
+                        )
+                    elif isinstance(event, ConfirmationRequested):
+                        if response_started:
+                            await self._write("\n")
+                            response_started = False
+                        await self._write(
+                            f"\n{event.preview.title}\n"
+                            f"{event.preview.details}\nApprove? [y/N] "
+                        )
+                        answer = await self._readline()
+                        approved = answer.strip().lower() in {"y", "yes"}
+                        run.resolve_confirmation(event.request_id, approved)
+                    elif isinstance(event, ConfirmationResolved):
+                        decision = "APPROVED" if event.approved else "REJECTED"
+                        await self._write(f"   [CONFIRMATION {decision}]\n")
+                    elif isinstance(event, UsageReported):
+                        if response_started:
+                            await self._write("\n")
+                            response_started = False
+                        await self._write(f"   [{usage_text(event)}]\n")
+                    elif isinstance(event, RunStopped):
+                        if response_started:
+                            await self._write("\n")
+                            response_started = False
+                        error = error_for_stop(event)
+                        if error is not None:
+                            await self._write(f"ERROR: {error.message}\n")
+                            await self._write(f"NEXT: {error.suggestion}\n")
+                        await self._write(
+                            f"{self.mewcode_marker} [{stop_label(event)}]\n"
+                        )
+            except KeyboardInterrupt:
+                await run.cancel()
+                await run.wait_closed()
+            except asyncio.CancelledError:
+                await asyncio.shield(run.cancel())
+                raise
 
-    def _write(self, text: str) -> None:
-        self.output_stream.write(text)
-        self.output_stream.flush()
+    async def _readline(self) -> str:
+        if self._threaded_input:
+            return await asyncio.to_thread(self.input_stream.readline)
+        return self.input_stream.readline()
 
-    def _write_header(self) -> None:
-        self._write(
+    async def _write(self, text: str) -> None:
+        def write_and_flush() -> None:
+            self.output_stream.write(text)
+            self.output_stream.flush()
+
+        if self._threaded_output:
+            await asyncio.to_thread(write_and_flush)
+        else:
+            write_and_flush()
+
+    async def _write_header(self) -> None:
+        await self._write(
             f"{CAT_BANNER}\n"
             "MEWCODE // CYBER TERMINAL\n"
             f"config   {self.config.name}\n"
             f"provider {self.config.protocol}\n"
             f"model    {self.config.model}\n"
-            "Type 'exit' or 'quit' to end the session.\n"
+            "Commands: /plan <task>, /do, exit, quit.\n"
         )

@@ -7,11 +7,8 @@ from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Collapsible, Markdown, Static
 
-from mewcode.tui.events import (
-    ToolFinishedPayload,
-    ToolStartedPayload,
-    TurnErrorPayload,
-)
+from mewcode.agent.events import ToolFinished, ToolStarted
+from mewcode.tui.presentation import ErrorPresentation
 
 
 class UserMessageView(Static):
@@ -117,7 +114,7 @@ class ConversationView(VerticalScroll):
 
 
 class ToolCard(Collapsible):
-    def __init__(self, payload: ToolStartedPayload, *, unicode: bool = True) -> None:
+    def __init__(self, payload: ToolStarted, *, unicode: bool = True) -> None:
         self.call_id = payload.call_id
         self.tool_name = payload.name
         self._separator = " · " if unicode else " - "
@@ -135,7 +132,7 @@ class ToolCard(Collapsible):
             classes="card tool-card",
         )
 
-    def finish(self, payload: ToolFinishedPayload) -> None:
+    def finish(self, payload: ToolFinished) -> None:
         if payload.call_id != self.call_id:
             raise ValueError("Tool completion does not match this card.")
         self.title = (
@@ -171,9 +168,17 @@ class ToolCard(Collapsible):
         }[payload.status]
         self.add_class(status_class)
 
+    def interrupt(self) -> None:
+        self.title = f"INTERRUPTED {self.tool_name}"
+        self._details.update(
+            "Execution was interrupted; already-started side effects are not rolled back."
+        )
+        self.remove_class("status-error", "status-success")
+        self.add_class("status-warning")
+
 
 class ErrorCard(Vertical):
-    def __init__(self, payload: TurnErrorPayload, *, unicode: bool = True) -> None:
+    def __init__(self, payload: ErrorPresentation, *, unicode: bool = True) -> None:
         details = payload.technical_detail or "No additional technical details."
         separator = " · " if unicode else " - "
         self.title = f"ERROR{separator}{payload.message}"
@@ -201,5 +206,5 @@ class ErrorCard(Vertical):
         return self._technical.collapsed
 
 
-def _started_details(payload: ToolStartedPayload) -> str:
+def _started_details(payload: ToolStarted) -> str:
     return payload.argument_summary or "No displayable arguments."

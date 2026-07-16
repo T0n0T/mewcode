@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 from dataclasses import dataclass
-from enum import Enum
 
 from textual.message import Message
 
 from mewcode.tools.base import ConfirmationPreview, ToolStatus
+from mewcode.tui.presentation import ActivityState
 from mewcode.turns import TurnPhase
 
 DEFAULT_ERROR_SUGGESTION = (
@@ -18,16 +18,6 @@ INTERNAL_ERROR_SUGGESTION = (
 TOOL_BUDGET_SUGGESTION = (
     "Start a new turn or ask for a final answer without another tool."
 )
-
-
-class ActivityState(str, Enum):
-    READY = "ready"
-    UPLINKING = "uplinking"
-    STREAMING = "streaming"
-    EXECUTING = "executing"
-    SYNTHESIZING = "synthesizing"
-    INTERRUPTED = "interrupted"
-    ERROR = "error"
 
 
 @dataclass(frozen=True)
