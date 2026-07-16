@@ -96,6 +96,30 @@ class CompletingThenBlockingProvider(ScriptedProvider):
         yield ProviderResponseCompleted({"text": self.retry_text})
 
 
+class CancellableThenCompletingProvider(ScriptedProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def stream_response(
+        self, history, tools, *, instructions, cancellation
+    ):
+        self.calls.append((tuple(history), tuple(tools), instructions, cancellation))
+        if len(self.calls) == 1:
+            self.entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            if False:
+                yield ProviderTextDelta("")
+            return
+        yield ProviderTextDelta("follow-up complete")
+        yield ProviderResponseCompleted({"text": "follow-up complete"})
+
+
 class FakeTool:
     manages_own_timeout = False
     requires_confirmation = False
@@ -270,6 +294,53 @@ async def test_single_run_rejects_overlap_then_preserves_history(tmp_path: Path)
 
     await first.cancel()
     assert session.history == (UserMessage("first"),)
+
+
+@pytest.mark.asyncio
+async def test_immediate_cancel_emits_terminal_and_releases_session(
+    tmp_path: Path,
+):
+    provider = ScriptedProvider([completed("follow-up complete")])
+    session = build_session(tmp_path, provider)
+    run = await session.start("cancel immediately")
+
+    await run.cancel()
+    async with asyncio.timeout(0.1):
+        events = await consume(run)
+
+    assert isinstance(events[0], RunStarted)
+    assert isinstance(events[-1], RunStopped)
+    assert events[-1].reason is StopReason.CANCELLED
+    assert provider.calls == []
+
+    follow_up = await consume(await session.start("next"))
+    assert follow_up[-1].reason is StopReason.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_consumer_close_break_cancels_run_cleans_up_and_allows_follow_up(
+    tmp_path: Path,
+):
+    provider = CancellableThenCompletingProvider()
+    session = build_session(tmp_path, provider)
+    run = await session.start("first")
+
+    async for event in run:
+        assert isinstance(event, RunStarted)
+        await provider.entered.wait()
+        break
+
+    async with asyncio.timeout(0.1):
+        await provider.cancelled.wait()
+    await run.wait_closed()
+
+    follow_up = await consume(await session.start("second"))
+    assert follow_up[-1].reason is StopReason.COMPLETED
+    assert session.history == (
+        UserMessage("first"),
+        UserMessage("second"),
+        AssistantMessage("follow-up complete", {"text": "follow-up complete"}),
+    )
 
 
 @pytest.mark.asyncio

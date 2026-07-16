@@ -4,17 +4,17 @@
 
 ## 验收实录（2026-07-16）
 
-- C01–C24、C26、C29–C34：Agent 核心与会话验收通过，`74 passed`；其中 Plan Mode 点名隐藏写工具已实测回写 `unknown_tool` 且零执行，计划/执行在取消、Provider 错误、未知工具与 10 轮上限后均按规格保留或可重试。
-- C25、C27、C28、C35、C44：Provider/工具/工作区回归 `79 passed`，TUI/CLI/配置回归 `77 passed`；4 张 Textual 快照通过，配置与依赖文件无功能差异。
+- C01–C24、C26、C29–C34：Agent 核心与会话验收通过，`76 passed`；其中 Plan Mode 点名隐藏写工具已实测回写 `unknown_tool` 且零执行，立即取消与消费者提前退出均释放 Session，计划/执行在取消、Provider 错误、未知工具与 10 轮上限后均按规格保留或可重试。
+- C25、C27、C28、C35、C44：Provider/工具/工作区回归 `79 passed`，TUI/CLI/配置回归 `78 passed`；4 张 Textual 快照通过，配置与依赖文件无功能差异。
 - C36–C38：异步界面与遗留入口扫描通过；`ChatRuntime|TurnCancellation|TurnPhaseChanged|ToolInteraction|TuiEventBridge|call_from_thread|thread=True` 无匹配。
-- C39：清单指定的 Agent、Provider、工具和 TUI 聚焦集 `127 passed`，4 张快照通过。
-- C40：`uv run pytest` 实际结果 `230 passed`，4 张快照通过。
+- C39：清单指定的 Agent、Provider、工具和 TUI 聚焦集 `130 passed`，4 张快照通过。
+- C40：`uv run pytest` 实际结果 `233 passed`，4 张快照通过。
 - C41：`uv run python -m compileall mewcode tests` 返回 0，无编译错误。
 - C42：`uv lock --check` 返回 0；`pyproject.toml`、`uv.lock` 无本里程碑功能差异。
 - C43：从空临时 cwd 与空 HOME 启动模块入口和 console script，二者均只显示缺失配置错误、实际退出码 1、无堆栈。
 - C45：README 关键字与人工核对通过，覆盖 Agent Loop、五类停止、`/plan`、`/do`、逐次确认及权限/压缩/持久化边界。
-- C46：`git diff --check c73872d`、真实配置跟踪检查、API key 新增行扫描与批准文件清单人工核对均通过；最终提交后的 clean 状态待最后复查。
-- E01–E08：脚本化端到端集合实际 `14 passed`，覆盖完整四工具自主链、混合批次屏障、Plan/Do、四种取消时点、断流恢复、三类消费者等价、双 Provider 与进程重启边界。
+- C46：`git diff --check c73872d`、真实配置跟踪检查、API key 新增行扫描、批准文件清单人工核对与最终工作树 clean 复查均通过。
+- E01–E08：脚本化端到端集合实际 `15 passed`，覆盖完整四工具自主链、混合批次屏障及全屏卡片身份、Plan/Do、四种取消时点、断流恢复、三类消费者等价、双 Provider 与进程重启边界。
 
 
 ## 自主循环与停止条件
@@ -85,7 +85,7 @@
 - [x] C43 模块入口和 console script 均可启动；空 HOME 下配置缺失时只显示可读错误、返回 1 且无堆栈（验证：分别运行 `env HOME="$(mktemp -d)" uv run python -m mewcode` 和 `env HOME="$(mktemp -d)" uv run mewcode`）。
 - [x] C44 配置文件位置、项目级优先级、Provider 字段与示例配置保持不变（验证：`uv run pytest tests/test_config.py tests/test_cli.py`，并检查 `git diff -- config.yaml.example mewcode/config.py` 无功能改动）。
 - [x] C45 README 明确说明 Agent Loop、五类停止条件、`/plan`、`/do`、逐次确认及本阶段不包含的权限/压缩/持久化边界（验证：`rg -n "Agent Loop|/plan|/do|iteration|unknown|cancel|confirm|permission|context|persist" README.md`）。
-- [ ] C46 改动范围符合批准的文件清单，无尾随空白、真实配置、API key 或无关文件（验证：运行 `git status --short`、`git diff --check`、`test -z "$(git ls-files -- .mewcode/config.yaml)"` 和 `! git diff -U0 | rg '^\+.*sk-(ant-)?[A-Za-z0-9_-]{20,}'`，期望均通过并人工核对文件清单）。
+- [x] C46 改动范围符合批准的文件清单，无尾随空白、真实配置、API key 或无关文件（验证：运行 `git status --short`、`git diff --check`、`test -z "$(git ls-files -- .mewcode/config.yaml)"` 和 `! git diff -U0 | rg '^\+.*sk-(ant-)?[A-Za-z0-9_-]{20,}'`，期望均通过并人工核对文件清单）。
 
 ## 端到端场景
 

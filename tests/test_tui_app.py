@@ -203,6 +203,32 @@ class BlockingSideEffectTool:
             raise
 
 
+class ScenarioTool:
+    manages_own_timeout = False
+
+    def __init__(self, name, policy, behavior, *, confirm=False) -> None:
+        self.definition = ToolDefinition(
+            name,
+            name,
+            {"type": "object", "properties": {}, "additionalProperties": False},
+        )
+        self.access = ToolAccess.MUTATING if confirm else ToolAccess.READ_ONLY
+        self.execution_policy = policy
+        self.requires_confirmation = confirm
+        self.behavior = behavior
+
+    async def prepare(self, arguments, context):
+        preview = (
+            ConfirmationPreview("write", self.definition.name, "safe")
+            if self.requires_confirmation
+            else None
+        )
+        return PreparedToolAction({}, preview)
+
+    async def execute(self, action, context):
+        return await self.behavior(self.definition.name)
+
+
 class DummySession:
     def __init__(self) -> None:
         self.close_calls = 0
@@ -390,6 +416,96 @@ async def test_tool_usage_confirmation_and_progress_share_run_events(tmp_path: P
         assert any("total:3" in line for line in usage)
         assert any("total:12" in line for line in usage)
         assert "hidden result" not in card._details.render().plain
+
+
+@pytest.mark.asyncio
+async def test_e2e_mixed_batch_tui_keeps_out_of_order_cards_attached(
+    tmp_path: Path,
+):
+    both_reads_started = asyncio.Event()
+    release_first_read = asyncio.Event()
+    active_reads = set()
+    execution = []
+
+    async def behavior(name):
+        execution.append(("start", name))
+        if name in {"a", "b"}:
+            active_reads.add(name)
+            if active_reads == {"a", "b"}:
+                both_reads_started.set()
+            await both_reads_started.wait()
+            if name == "a":
+                await release_first_read.wait()
+            else:
+                release_first_read.set()
+        execution.append(("finish", name))
+        return ToolResult(status="success", data={"name": name})
+
+    tools = [
+        ScenarioTool("a", ToolExecutionPolicy.PARALLEL_SAFE, behavior),
+        ScenarioTool("b", ToolExecutionPolicy.PARALLEL_SAFE, behavior),
+        ScenarioTool(
+            "c",
+            ToolExecutionPolicy.SERIAL,
+            behavior,
+            confirm=True,
+        ),
+        ScenarioTool("d", ToolExecutionPolicy.PARALLEL_SAFE, behavior),
+    ]
+    provider = ScriptedProvider(
+        [
+            [
+                ProviderToolCallDelta(
+                    index,
+                    call_id_delta=f"call-{name}",
+                    name_delta=name,
+                    arguments_delta="{}",
+                )
+                for index, name in enumerate("abcd")
+            ]
+            + [ProviderResponseCompleted({})],
+            completed("mixed batch complete"),
+        ]
+    )
+    app = CyberpunkChatApp(
+        build_session(tmp_path, provider, tools=tools),
+        metadata(tmp_path),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        app.query_one(PromptComposer).load_text("mixed")
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: isinstance(app.screen, ConfirmationModal))
+        await pilot.press("y")
+        await wait_for(pilot, lambda: app._active_run is None)
+
+        assert execution == [
+            ("start", "a"),
+            ("start", "b"),
+            ("finish", "b"),
+            ("finish", "a"),
+            ("start", "c"),
+            ("finish", "c"),
+            ("start", "d"),
+            ("finish", "d"),
+        ]
+        assert [
+            str(card.title).split(" ·", 1)[0] for card in app.query(ToolCard)
+        ] == [
+            "SUCCESS a",
+            "SUCCESS b",
+            "SUCCESS c",
+            "SUCCESS d",
+        ]
+        assert all(
+            str(app._tool_cards[f"call-{name}"].title).startswith(
+                f"SUCCESS {name}"
+            )
+            for name in "abcd"
+        )
+        feedback = provider.calls[1][0][-1]
+        assert isinstance(feedback, ToolResultsMessage)
+        assert [item.name for item in feedback.results] == list("abcd")
 
 
 @pytest.mark.asyncio

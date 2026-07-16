@@ -101,6 +101,7 @@ class AgentRun:
             capacity=event_capacity,
             on_consumer_close=self.cancel,
         )
+        self._task_started = False
         self._task = asyncio.create_task(self._run())
 
     @property
@@ -112,12 +113,21 @@ class AgentRun:
         return self._request.mode
 
     def __aiter__(self):
-        return self._events.events()
+        stream = self._events.events()
+
+        async def iterate():
+            try:
+                async for event in stream:
+                    yield event
+            finally:
+                await stream.aclose()
+
+        return iterate()
 
     async def cancel(self) -> None:
         self._cancellation.cancel()
         self._confirmations.cancel_all()
-        if not self._task.done():
+        if not self._task.done() and self._task_started:
             self._task.cancel()
         with suppress(asyncio.CancelledError):
             await self._task
@@ -190,6 +200,7 @@ class AgentRun:
         )
 
     async def _run(self) -> None:
+        self._task_started = True
         iteration = 1
         try:
             await self._publish(
@@ -209,6 +220,8 @@ class AgentRun:
                     code=code,
                 )
                 return
+            if self._cancellation.is_cancelled:
+                raise asyncio.CancelledError
             for iteration in range(1, self._max_iterations + 1):
                 self._current_iteration = iteration
                 await self._progress(RunPhase.WAITING_MODEL, iteration)
