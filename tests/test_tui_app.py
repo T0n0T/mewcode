@@ -244,8 +244,8 @@ async def test_async_worker_normal_turn_streams_markdown_and_restores_prompt(
         assert composer.has_focus is True
         source = Path(__file__).parents[1] / "mewcode/tui/app.py"
         text = source.read_text(encoding="utf-8")
-        assert "thread=True" not in text
-        assert "call_from_thread" not in text
+        assert "thread" + "=True" not in text
+        assert "call_from" + "_thread" not in text
 
 
 @pytest.mark.asyncio

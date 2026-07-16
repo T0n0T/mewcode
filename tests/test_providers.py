@@ -108,6 +108,19 @@ def tool_definition():
     )
 
 
+@pytest.fixture
+def no_proxy_env(monkeypatch):
+    for name in (
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def sse(data, event=None):
     lines = []
     if event:
@@ -152,12 +165,19 @@ def test_base_types_token_usage_and_protocol_are_async():
     assert inspect.iscoroutinefunction(LLMProvider.aclose)
 
 
-def test_factory_creates_both_providers_and_rejects_unknown(openai_config, anthropic_config):
-    assert isinstance(create_provider(openai_config), OpenAIProvider)
-    assert isinstance(create_provider(anthropic_config), AnthropicProvider)
+@pytest.mark.asyncio
+async def test_factory_creates_both_providers_and_rejects_unknown(
+    openai_config, anthropic_config, no_proxy_env
+):
+    openai = create_provider(openai_config)
+    anthropic = create_provider(anthropic_config)
+    assert isinstance(openai, OpenAIProvider)
+    assert isinstance(anthropic, AnthropicProvider)
     bad = LLMConfig("bad", "other", "model", "https://example.test", "secret")
     with pytest.raises(ProviderError, match="Unsupported protocol"):
         create_provider(bad)
+    await openai.aclose()
+    await anthropic.aclose()
 
 
 @pytest.mark.asyncio
@@ -263,7 +283,7 @@ async def test_openai_completed_protocol_errors_and_redaction(openai_config):
 
 
 @pytest.mark.asyncio
-async def test_openai_cancellation_and_client_ownership(openai_config):
+async def test_openai_cancellation_and_client_ownership(openai_config, no_proxy_env):
     cancelled = CancellationToken()
     cancelled.cancel()
     client = MockHTTPClient(MockResponse())
@@ -382,7 +402,9 @@ async def test_anthropic_completed_errors_redaction_and_thinking_disabled(anthro
 
 
 @pytest.mark.asyncio
-async def test_anthropic_cancellation_and_client_ownership(anthropic_config):
+async def test_anthropic_cancellation_and_client_ownership(
+    anthropic_config, no_proxy_env
+):
     cancelled = CancellationToken()
     cancelled.cancel()
     client = MockHTTPClient(MockResponse())

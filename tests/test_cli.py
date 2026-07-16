@@ -1,10 +1,12 @@
 from io import StringIO
 from pathlib import Path
 
+import pytest
+
 import mewcode.cli as cli
-from mewcode.providers.base import ResponseCompleted, TextDelta
+from mewcode.agent import AgentSession
+from mewcode.providers.base import ProviderResponseCompleted, ProviderTextDelta
 from mewcode.tui import TerminalMode
-from mewcode.tui.interaction import TuiToolInteraction
 
 
 def write_config(tmp_path: Path) -> Path:
@@ -21,9 +23,19 @@ def write_config(tmp_path: Path) -> Path:
 
 
 class FakeProvider:
-    def stream_response(self, history, tools, cancellation):
-        yield TextDelta("ok")
-        yield ResponseCompleted([])
+    def __init__(self) -> None:
+        self.calls = []
+        self.close_calls = 0
+
+    async def stream_response(
+        self, history, tools, *, instructions, cancellation
+    ):
+        self.calls.append((tuple(history), tuple(tools), instructions))
+        yield ProviderTextDelta("ok")
+        yield ProviderResponseCompleted({"ok": True})
+
+    async def aclose(self):
+        self.close_calls += 1
 
 
 def test_cli_main_returns_nonzero_for_startup_config_error(tmp_path: Path):
@@ -40,9 +52,12 @@ def test_cli_main_returns_nonzero_for_startup_config_error(tmp_path: Path):
     assert "Config file not found" in stderr.getvalue()
 
 
-def test_cli_injected_streams_use_plain_mode(monkeypatch, tmp_path: Path):
+def test_cli_injected_streams_use_plain_async_main_and_close_once(
+    monkeypatch, tmp_path: Path
+):
     config_path = write_config(tmp_path)
-    monkeypatch.setattr(cli, "create_provider", lambda loaded: FakeProvider())
+    provider = FakeProvider()
+    monkeypatch.setattr(cli, "create_provider", lambda loaded: provider)
     stdout = StringIO()
 
     code = cli.main(
@@ -56,20 +71,15 @@ def test_cli_injected_streams_use_plain_mode(monkeypatch, tmp_path: Path):
     assert "◆ ok" in stdout.getvalue()
     assert "assistant" not in stdout.getvalue().lower()
     assert "\x1b" not in stdout.getvalue()
+    assert provider.close_calls == 1
 
 
 def test_cli_fixes_current_directory_as_workspace(monkeypatch, tmp_path: Path):
     config_path = write_config(tmp_path)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    provider = FakeProvider()
     observed = {}
-
-    class RecordingProvider:
-        def stream_response(self, history, tools, cancellation):
-            observed["tools"] = [tool.name for tool in tools]
-            yield TextDelta("ok")
-            yield ResponseCompleted([])
-
     real_workspace = cli.Workspace
 
     def recording_workspace(root):
@@ -78,7 +88,7 @@ def test_cli_fixes_current_directory_as_workspace(monkeypatch, tmp_path: Path):
 
     monkeypatch.chdir(workspace)
     monkeypatch.setattr(cli, "Workspace", recording_workspace)
-    monkeypatch.setattr(cli, "create_provider", lambda loaded: RecordingProvider())
+    monkeypatch.setattr(cli, "create_provider", lambda loaded: provider)
 
     code = cli.main(
         config_path=config_path,
@@ -89,7 +99,7 @@ def test_cli_fixes_current_directory_as_workspace(monkeypatch, tmp_path: Path):
 
     assert code == 0
     assert observed["root"] == workspace
-    assert observed["tools"] == [
+    assert [definition.name for definition in provider.calls[0][1]] == [
         "read_file",
         "write_file",
         "edit_file",
@@ -99,58 +109,69 @@ def test_cli_fixes_current_directory_as_workspace(monkeypatch, tmp_path: Path):
     ]
 
 
-def test_cli_fullscreen_mode_wires_bridge_runtime_and_metadata(
+@pytest.mark.asyncio
+async def test_async_main_fullscreen_wires_session_and_uses_single_close(
     monkeypatch,
     tmp_path: Path,
 ):
     config_path = write_config(tmp_path)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    provider = FakeProvider()
     observed = {}
 
     class FakeFullscreenApp:
-        def __init__(
-            self,
-            runtime,
-            metadata,
-            bridge,
-            *,
-            unicode_output,
-        ):
-            observed["runtime"] = runtime
+        def __init__(self, session, metadata, *, unicode_output):
+            observed["session"] = session
             observed["metadata"] = metadata
-            observed["bridge"] = bridge
             observed["unicode_output"] = unicode_output
 
-        def run(self):
+        async def run_async(self):
             return 23
 
     monkeypatch.chdir(workspace)
-    monkeypatch.setattr(cli, "create_provider", lambda loaded: object())
+    monkeypatch.setattr(cli, "create_provider", lambda loaded: provider)
     monkeypatch.setattr(
         cli,
         "detect_terminal_mode",
         lambda input_stream, output_stream: TerminalMode.FULLSCREEN,
-        raising=False,
     )
-    monkeypatch.setattr(
-        cli,
-        "CyberpunkChatApp",
-        FakeFullscreenApp,
-        raising=False,
-    )
+    monkeypatch.setattr(cli, "CyberpunkChatApp", FakeFullscreenApp)
 
-    code = cli.main(
+    code = await cli.async_main(
         config_path=config_path,
         stdin=StringIO(),
         stdout=StringIO(),
-        stderr=StringIO(),
     )
 
     assert code == 23
+    assert isinstance(observed["session"], AgentSession)
     assert observed["metadata"].workspace == workspace
     assert observed["metadata"].model == "model"
     assert observed["unicode_output"] is True
-    interaction = observed["runtime"]._executor.interaction
-    assert isinstance(interaction, TuiToolInteraction)
-    assert interaction.bridge is observed["bridge"]
+    assert provider.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_async_main_closes_session_when_interface_fails(monkeypatch, tmp_path):
+    config_path = write_config(tmp_path)
+    provider = FakeProvider()
+
+    class FailingPlainApp:
+        def __init__(self, session, config, **kwargs):
+            pass
+
+        async def run(self):
+            raise RuntimeError("interface failed")
+
+    monkeypatch.setattr(cli, "create_provider", lambda loaded: provider)
+    monkeypatch.setattr(cli, "PlainChatApp", FailingPlainApp)
+
+    with pytest.raises(RuntimeError, match="interface failed"):
+        await cli.async_main(
+            config_path=config_path,
+            stdin=StringIO(),
+            stdout=StringIO(),
+        )
+
+    assert provider.close_calls == 1

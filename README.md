@@ -1,6 +1,45 @@
 # MewCode
 
-MewCode is a command-line AI chat assistant with interactive multi-turn chat, streaming model output, and a small workspace tool system.
+MewCode is a command-line AI chat assistant with interactive multi-turn chat,
+streaming model output, an autonomous Agent Loop, and a small workspace tool
+system.
+
+## Agent Loop
+
+Each request can continue through multiple model and tool rounds without the
+user sending “continue.” MewCode streams model text as it arrives, waits for a
+complete response before executing any collected calls, runs the permitted tool
+batches, feeds their structured results back to the model, and repeats until the
+model returns a complete response without tools.
+
+Every run reports its mode, current round, progress, tool state, Provider token
+usage when available, and a machine-readable stop reason. A run stops when:
+
+- the model naturally completes without another tool call;
+- the tenth iteration finishes, without an eleventh request or extra summary;
+- the user cancels the active model, tool, or confirmation wait;
+- three consecutive rounds contain only unknown tools; or
+- the Provider connection, stream parsing, or completion protocol fails.
+
+Complete assistant calls and their tool results are committed to the in-process
+history as one unit. A cancelled or broken partial iteration is not committed,
+while complete earlier iterations remain available to the next request.
+
+### Plan mode
+
+- `/plan <task>` runs the same Agent Loop with only `read_file`, `glob_files`,
+  and `search_code` visible, then saves a naturally completed answer as the
+  current plan.
+- `/do` executes the most recent saved and not-yet-completed plan with all six
+  tools. It accepts no extra task text.
+- A successful new `/plan` replaces the previous plan. Cancellation, Provider
+  errors, the iteration limit, or repeated unknown tools preserve the previous
+  plan.
+- A naturally completed `/do` marks the plan complete. An interrupted or failed
+  `/do` leaves it ready to retry; a completed plan cannot be executed twice.
+
+Plans, history, progress, events, and usage remain in memory only and are not
+persisted after restart.
 
 ## Tools and safety
 
@@ -13,11 +52,21 @@ MewCode exposes six tools to both supported providers:
 - `glob_files` finds workspace files by pattern.
 - `search_code` searches text content by literal text or regular expression.
 
-Each turn may execute at most one tool. After the result is returned, the model may only produce a final text answer; a second tool request is rejected.
+One model response may request multiple tools. Adjacent read, glob, and search
+calls can run concurrently. Write, edit, and command calls run serially and act
+as ordering barriers; model feedback always preserves the original call order.
+Unknown tools, invalid arguments, rejection, timeout, and ordinary tool failures
+become structured feedback so the model can adjust within the remaining rounds.
 
 File tools accept workspace-relative paths only and prevent `..`, absolute-path, and symlink escapes. Explicit `read_file` paths may read ignored files, while `glob_files` and `search_code` follow `.gitignore` and always exclude `.git`. File content must be valid UTF-8 text.
 
-`write_file`, `edit_file`, and `run_command` require confirmation every time. Only `y` or `yes` approves an action. Shell commands run from the startup directory with the current shell's semantics. They do not run in an operating-system-level sandbox and can affect anything permitted to the MewCode process; review every command before approving it.
+`write_file`, `edit_file`, and `run_command` require confirmation every time,
+including during `/do`; there is no automatic approval or permission system.
+Only `y` or `yes` approves an action in the plain interface. Shell commands run
+from the startup directory with the current shell's semantics. They do not run
+in an operating-system-level sandbox and can affect anything permitted to the
+MewCode process; review every command before approving it. Cancellation does
+not promise to roll back a side effect that already started.
 
 ## Usage
 
@@ -72,8 +121,10 @@ Set `NO_COLOR=1` to keep the full-screen hierarchy while removing color. MewCode
 also falls back to ASCII markers when the output encoding cannot represent its
 Unicode symbols.
 
-This version has no slash commands, command palette, model switcher, theme
-configuration, or persistent chat history.
+This version has `/plan` and `/do`, but no command palette, model switcher,
+theme configuration, context compression, persistent chat history or plans,
+checkpoint recovery, multi-agent delegation, or configurable permission
+system.
 
 ## Configuration
 
