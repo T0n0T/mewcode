@@ -277,7 +277,7 @@ class AgentRun:
         except asyncio.CancelledError:
             self._cancellation.cancel()
             await self._stop(StopReason.CANCELLED, "Run cancelled.", iteration)
-        except ProviderError as exc:
+        except ProviderError:
             if self._cancellation.is_cancelled:
                 await self._stop(
                     StopReason.CANCELLED, "Run cancelled.", iteration
@@ -286,7 +286,7 @@ class AgentRun:
                 self._cancellation.cancel()
                 await self._stop(
                     StopReason.PROVIDER_ERROR,
-                    str(exc),
+                    "The model provider stopped because of an error.",
                     iteration,
                     code="provider_error",
                 )
@@ -329,8 +329,19 @@ class AgentRun:
         *,
         code: str | None = None,
     ) -> bool:
+        stopping = (
+            ProgressChanged(
+                self._context(iteration),
+                RunPhase.STOPPING,
+                iteration,
+                self._max_iterations,
+            )
+            if iteration is not None
+            else None
+        )
         stopped = await self._events.stop(
-            RunStopped(self._context(iteration), reason, message, code)
+            RunStopped(self._context(iteration), reason, message, code),
+            before=stopping,
         )
         if stopped:
             self._stop_reason = reason

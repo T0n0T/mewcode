@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 from uuid import uuid4
@@ -60,10 +60,16 @@ class ToolScheduler:
         executor: ToolExecutor,
         *,
         id_factory: Callable[[], str] | None = None,
+        allowed_tool_names: Collection[str] | None = None,
     ) -> None:
         self._registry = registry
         self._executor = executor
         self._id_factory = id_factory or _new_id
+        self._allowed_tool_names = (
+            None
+            if allowed_tool_names is None
+            else frozenset(allowed_tool_names)
+        )
 
     def parse_calls(
         self, calls: Sequence[RawToolCall]
@@ -79,7 +85,17 @@ class ToolScheduler:
                 arguments = value
             except (json.JSONDecodeError, ValueError) as exc:
                 error = _error("invalid_arguments", f"Invalid tool arguments: {exc}")
-            descriptor = self._registry.descriptor(call.name)
+            allowed = (
+                self._allowed_tool_names is None
+                or call.name in self._allowed_tool_names
+            )
+            descriptor = self._registry.descriptor(call.name) if allowed else None
+            if not allowed:
+                arguments = None
+                error = _error(
+                    "unknown_tool",
+                    f"Unknown tool '{call.name}'.",
+                )
             policy = (
                 descriptor.execution_policy
                 if descriptor is not None

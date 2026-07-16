@@ -116,9 +116,10 @@ async def test_mixed_valid_invalid_and_unknown_calls_keep_independent_results(
     )
     outcome = await service.execute(
         [
-            raw(0, "read", call_id="valid"),
-            raw(1, "read", "[", call_id="invalid"),
-            raw(2, "missing", call_id="unknown"),
+            raw(0, "read", call_id="valid-one"),
+            raw(1, "read", call_id="valid-two"),
+            raw(2, "read", "[", call_id="invalid"),
+            raw(3, "missing", call_id="unknown"),
         ],
         iteration=1,
         cancellation=CancellationToken(),
@@ -126,14 +127,15 @@ async def test_mixed_valid_invalid_and_unknown_calls_keep_independent_results(
     )
 
     assert [feedback.call_id for feedback in outcome.feedback] == [
-        "valid",
+        "valid-one",
+        "valid-two",
         "invalid",
         "unknown",
     ]
     assert [
         feedback.result.error.code if feedback.result.error is not None else None
         for feedback in outcome.feedback
-    ] == [None, "invalid_arguments", "unknown_tool"]
+    ] == [None, None, "invalid_arguments", "unknown_tool"]
     assert outcome.all_unknown is False
 
 
@@ -380,3 +382,69 @@ async def test_cancellation_aborts_parallel_batch_and_later_barrier(tmp_path: Pa
     with pytest.raises(asyncio.CancelledError):
         await task
     assert later_calls == []
+
+
+@pytest.mark.asyncio
+async def test_e2e_mixed_batch_parallel_then_serial_barrier_preserves_feedback(
+    tmp_path: Path,
+):
+    both_reads_started = asyncio.Event()
+    release_first_read = asyncio.Event()
+    active_reads = set()
+    execution = []
+
+    async def behavior(name):
+        execution.append(("start", name))
+        if name in {"a", "b"}:
+            active_reads.add(name)
+            if active_reads == {"a", "b"}:
+                both_reads_started.set()
+            await both_reads_started.wait()
+            if name == "a":
+                await release_first_read.wait()
+            else:
+                release_first_read.set()
+        execution.append(("finish", name))
+        return ToolResult(status="success", data={"name": name})
+
+    service = scheduler(
+        tmp_path,
+        [
+            FakeTool("a", ToolExecutionPolicy.PARALLEL_SAFE, behavior=behavior),
+            FakeTool("b", ToolExecutionPolicy.PARALLEL_SAFE, behavior=behavior),
+            FakeTool(
+                "c",
+                ToolExecutionPolicy.SERIAL,
+                confirm=True,
+                behavior=behavior,
+            ),
+            FakeTool("d", ToolExecutionPolicy.PARALLEL_SAFE, behavior=behavior),
+        ],
+    )
+    events = RecordingEvents(approvals=True)
+
+    async with asyncio.timeout(1):
+        outcome = await service.execute(
+            [raw(index, name) for index, name in enumerate("abcd")],
+            iteration=1,
+            cancellation=CancellationToken(),
+            events=events,
+        )
+
+    assert execution == [
+        ("start", "a"),
+        ("start", "b"),
+        ("finish", "b"),
+        ("finish", "a"),
+        ("start", "c"),
+        ("finish", "c"),
+        ("start", "d"),
+        ("finish", "d"),
+    ]
+    assert [record for record in events.records if record[0] == "finished"] == [
+        ("finished", "b"),
+        ("finished", "a"),
+        ("finished", "c"),
+        ("finished", "d"),
+    ]
+    assert [feedback.name for feedback in outcome.feedback] == list("abcd")

@@ -177,6 +177,7 @@ class CyberpunkChatApp(App[int]):
             await asyncio.shield(run.cancel())
             raise
         except Exception:
+            await asyncio.shield(run.cancel())
             await self._flush_before_event()
             if self._is_current(run.run_id):
                 await self._remove_activity()

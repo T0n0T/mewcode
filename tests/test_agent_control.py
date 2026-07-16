@@ -3,8 +3,13 @@ import asyncio
 import pytest
 
 from mewcode.agent.control import ConfirmationBroker, EventChannel
-from mewcode.agent.events import EventContext, RunStopped, TextDeltaEvent
-from mewcode.agent.types import StopReason
+from mewcode.agent.events import (
+    EventContext,
+    ProgressChanged,
+    RunStopped,
+    TextDeltaEvent,
+)
+from mewcode.agent.types import RunPhase, StopReason
 from mewcode.cancellation import CancellationToken
 
 
@@ -65,9 +70,15 @@ async def test_event_queue_applies_backpressure_at_capacity():
 async def test_terminal_event_uses_reserved_capacity_when_queue_is_full():
     channel = EventChannel("run", capacity=1)
     await channel.publish(text_event("queued"))
+    before = ProgressChanged(
+        EventContext("run", 0, 1),
+        RunPhase.STOPPING,
+        1,
+        10,
+    )
     terminal = RunStopped(EventContext("run", 0, 1), StopReason.CANCELLED, "cancelled")
 
-    stopping = asyncio.create_task(channel.stop(terminal))
+    stopping = asyncio.create_task(channel.stop(terminal, before=before))
     await asyncio.sleep(0)
     completed_without_drain = stopping.done()
     if not completed_without_drain:
@@ -79,8 +90,17 @@ async def test_terminal_event_uses_reserved_capacity_when_queue_is_full():
     assert stopping.result() is True
     queued = await channel.get()
     assert isinstance(queued, TextDeltaEvent)
-    observed = await anext(channel.events())
-    assert isinstance(observed, RunStopped)
+    events = channel.events()
+    observed_before = await anext(events)
+    observed_terminal = await anext(events)
+    assert isinstance(observed_before, ProgressChanged)
+    assert observed_before.phase is RunPhase.STOPPING
+    assert isinstance(observed_terminal, RunStopped)
+    assert [
+        queued.context.sequence,
+        observed_before.context.sequence,
+        observed_terminal.context.sequence,
+    ] == [1, 2, 3]
 
 
 @pytest.mark.asyncio

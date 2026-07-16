@@ -18,7 +18,9 @@ class EventChannel:
         if capacity < 1:
             raise ValueError("Event channel capacity must be at least 1.")
         self.run_id = run_id
-        self._queue: asyncio.Queue[AgentEvent] = asyncio.Queue(capacity + 1)
+        self._queue: asyncio.Queue[tuple[AgentEvent, bool]] = asyncio.Queue(
+            capacity + 2
+        )
         self._ordinary_slots = asyncio.Semaphore(capacity)
         self._lock = asyncio.Lock()
         self._sequence = 0
@@ -46,18 +48,36 @@ class EventChannel:
                         sequence=self._sequence,
                     ),
                 )
-                self._queue.put_nowait(contextualized)
+                self._queue.put_nowait((contextualized, True))
                 enqueued = True
                 return True
         finally:
             if not enqueued:
                 self._ordinary_slots.release()
 
-    async def stop(self, event: RunStopped) -> bool:
+    async def stop(
+        self,
+        event: RunStopped,
+        *,
+        before: AgentEvent | None = None,
+    ) -> bool:
+        if isinstance(before, RunStopped):
+            raise ValueError("A terminal prelude cannot be RunStopped.")
         async with self._lock:
             if self._terminal:
                 return False
             self._terminal = True
+            if before is not None:
+                self._sequence += 1
+                contextualized_before = replace(
+                    before,
+                    context=replace(
+                        before.context,
+                        run_id=self.run_id,
+                        sequence=self._sequence,
+                    ),
+                )
+                self._queue.put_nowait((contextualized_before, False))
             self._sequence += 1
             contextualized = replace(
                 event,
@@ -67,12 +87,12 @@ class EventChannel:
                     sequence=self._sequence,
                 ),
             )
-            self._queue.put_nowait(contextualized)
+            self._queue.put_nowait((contextualized, False))
             return True
 
     async def get(self) -> AgentEvent:
-        event = await self._queue.get()
-        if not isinstance(event, RunStopped):
+        event, uses_ordinary_slot = await self._queue.get()
+        if uses_ordinary_slot:
             self._ordinary_slots.release()
         return event
 

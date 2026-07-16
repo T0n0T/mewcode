@@ -17,12 +17,18 @@ from mewcode.agent.types import (
     StoredPlan,
 )
 from mewcode.errors import MewCodeError, ProviderError
-from mewcode.messages import AssistantMessage, UserMessage
-from mewcode.providers.base import ProviderResponseCompleted, ProviderTextDelta
+from mewcode.messages import AssistantMessage, ToolResultsMessage, UserMessage
+from mewcode.providers.base import (
+    ProviderResponseCompleted,
+    ProviderTextDelta,
+    ProviderToolCallDelta,
+)
 from mewcode.tools.base import (
+    PreparedToolAction,
     ToolAccess,
     ToolDefinition,
     ToolExecutionPolicy,
+    ToolResult,
 )
 from mewcode.tools.executor import ToolExecutor
 from mewcode.tools.registry import ToolRegistry
@@ -64,6 +70,32 @@ class BlockingProvider(ScriptedProvider):
             yield ProviderTextDelta("")
 
 
+class CompletingThenBlockingProvider(ScriptedProvider):
+    def __init__(self, first_text: str, retry_text: str | None = None) -> None:
+        super().__init__()
+        self.first_text = first_text
+        self.retry_text = retry_text
+        self.entered = asyncio.Event()
+
+    async def stream_response(
+        self, history, tools, *, instructions, cancellation
+    ):
+        self.calls.append((tuple(history), tuple(tools), instructions, cancellation))
+        if len(self.calls) == 1:
+            yield ProviderTextDelta(self.first_text)
+            yield ProviderResponseCompleted({"text": self.first_text})
+            return
+        if len(self.calls) == 2:
+            self.entered.set()
+            await asyncio.Event().wait()
+            if False:
+                yield ProviderTextDelta("")
+            return
+        assert self.retry_text is not None
+        yield ProviderTextDelta(self.retry_text)
+        yield ProviderResponseCompleted({"text": self.retry_text})
+
+
 class FakeTool:
     manages_own_timeout = False
     requires_confirmation = False
@@ -80,6 +112,14 @@ class FakeTool:
             if access is ToolAccess.READ_ONLY
             else ToolExecutionPolicy.SERIAL
         )
+        self.executions = 0
+
+    async def prepare(self, arguments, context):
+        return PreparedToolAction({}, None)
+
+    async def execute(self, action, context):
+        self.executions += 1
+        return ToolResult(status="success")
 
 
 def build_session(tmp_path: Path, provider, **kwargs):
@@ -92,6 +132,18 @@ def build_session(tmp_path: Path, provider, **kwargs):
 
 def completed(text: str):
     return [ProviderTextDelta(text), ProviderResponseCompleted({"text": text})]
+
+
+def tool_completed(call_id: str, name: str):
+    return [
+        ProviderToolCallDelta(
+            0,
+            call_id_delta=call_id,
+            name_delta=name,
+            arguments_delta="{}",
+        ),
+        ProviderResponseCompleted({"call": call_id}),
+    ]
 
 
 async def consume(run):
@@ -221,7 +273,7 @@ async def test_single_run_rejects_overlap_then_preserves_history(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_plan_save_replaces_only_after_success_and_uses_read_only_tools(
+async def test_plan_replace_and_preserve_only_after_success_uses_read_only_tools(
     tmp_path: Path,
 ):
     provider = ScriptedProvider(
@@ -257,6 +309,109 @@ async def test_plan_save_replaces_only_after_success_and_uses_read_only_tools(
         [definition.name for definition in call[1]] == ["read"]
         for call in provider.calls
     )
+
+
+@pytest.mark.asyncio
+async def test_plan_read_only_treats_named_mutating_tool_as_unknown(
+    tmp_path: Path,
+):
+    provider = ScriptedProvider(
+        [
+            [
+                ProviderToolCallDelta(
+                    0,
+                    call_id_delta="call-write",
+                    name_delta="write",
+                    arguments_delta="{}",
+                ),
+                ProviderResponseCompleted({}),
+            ],
+            completed("safe plan"),
+        ]
+    )
+    registry = ToolRegistry()
+    read = FakeTool("read", ToolAccess.READ_ONLY)
+    write = FakeTool("write", ToolAccess.MUTATING)
+    registry.register(read)
+    registry.register(write)
+    session = AgentSession(
+        provider,
+        registry,
+        ToolExecutor(registry, Workspace(tmp_path)),
+    )
+
+    events = await consume(await session.start("/plan inspect safely"))
+
+    assert events[-1].reason is StopReason.COMPLETED
+    assert write.executions == 0
+    assert all(
+        [definition.name for definition in call[1]] == ["read"]
+        for call in provider.calls
+    )
+    feedback = next(
+        message
+        for message in session.history
+        if isinstance(message, ToolResultsMessage)
+    )
+    assert feedback.results[0].result.error is not None
+    assert feedback.results[0].result.error.code == "unknown_tool"
+    assert session.current_plan is not None
+    assert session.current_plan.content == "safe plan"
+
+
+@pytest.mark.asyncio
+async def test_plan_preserve_after_unknown_tool_and_iteration_limits(
+    tmp_path: Path,
+):
+    unknown_provider = ScriptedProvider(
+        [
+            completed("plan A"),
+            *(tool_completed(f"unknown-{index}", "missing") for index in range(3)),
+        ]
+    )
+    unknown_session = build_session(tmp_path, unknown_provider)
+    await consume(await unknown_session.start("/plan original"))
+    plan_a = unknown_session.current_plan
+
+    unknown_events = await consume(
+        await unknown_session.start("/plan unsafe replacement")
+    )
+
+    assert unknown_events[-1].reason is StopReason.UNKNOWN_TOOL_LIMIT
+    assert unknown_session.current_plan == plan_a
+
+    iteration_provider = ScriptedProvider(
+        [
+            completed("plan B"),
+            *(tool_completed(f"known-{index}", "read") for index in range(10)),
+        ]
+    )
+    iteration_session = build_session(tmp_path, iteration_provider)
+    await consume(await iteration_session.start("/plan original"))
+    plan_b = iteration_session.current_plan
+
+    iteration_events = await consume(
+        await iteration_session.start("/plan endless replacement")
+    )
+
+    assert iteration_events[-1].reason is StopReason.ITERATION_LIMIT
+    assert iteration_session.current_plan == plan_b
+
+
+@pytest.mark.asyncio
+async def test_plan_preserve_after_cancellation(tmp_path: Path):
+    provider = CompletingThenBlockingProvider("plan A")
+    session = build_session(tmp_path, provider)
+    await consume(await session.start("/plan original"))
+    plan_a = session.current_plan
+
+    replacement = await session.start("/plan replacement")
+    await provider.entered.wait()
+    await replacement.cancel()
+    events = await consume(replacement)
+
+    assert events[-1].reason is StopReason.CANCELLED
+    assert session.current_plan == plan_a
 
 
 @pytest.mark.asyncio
@@ -307,6 +462,71 @@ async def test_do_lifecycle_preserves_ready_plan_after_error_for_retry(tmp_path:
 
     retried = await consume(await session.start("/do"))
     assert retried[-1].reason is StopReason.COMPLETED
+    assert session.current_plan is not None
+    assert session.current_plan.status is PlanStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_do_lifecycle_preserves_ready_plan_after_limits(tmp_path: Path):
+    unknown_provider = ScriptedProvider(
+        [
+            completed("saved unknown plan"),
+            *(tool_completed(f"unknown-{index}", "missing") for index in range(3)),
+            completed("unknown retry complete"),
+        ]
+    )
+    unknown_session = build_session(tmp_path, unknown_provider)
+    await consume(await unknown_session.start("/plan prepare"))
+    unknown_ready = unknown_session.current_plan
+
+    unknown_events = await consume(await unknown_session.start("/do"))
+
+    assert unknown_events[-1].reason is StopReason.UNKNOWN_TOOL_LIMIT
+    assert unknown_session.current_plan == unknown_ready
+    unknown_retry = await consume(await unknown_session.start("/do"))
+    assert unknown_retry[-1].reason is StopReason.COMPLETED
+    assert unknown_session.current_plan is not None
+    assert unknown_session.current_plan.status is PlanStatus.COMPLETED
+
+    iteration_provider = ScriptedProvider(
+        [
+            completed("saved iteration plan"),
+            *(tool_completed(f"known-{index}", "read") for index in range(10)),
+            completed("iteration retry complete"),
+        ]
+    )
+    iteration_session = build_session(tmp_path, iteration_provider)
+    await consume(await iteration_session.start("/plan prepare"))
+    iteration_ready = iteration_session.current_plan
+
+    iteration_events = await consume(await iteration_session.start("/do"))
+
+    assert iteration_events[-1].reason is StopReason.ITERATION_LIMIT
+    assert iteration_session.current_plan == iteration_ready
+    iteration_retry = await consume(await iteration_session.start("/do"))
+    assert iteration_retry[-1].reason is StopReason.COMPLETED
+    assert iteration_session.current_plan is not None
+    assert iteration_session.current_plan.status is PlanStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_do_lifecycle_preserves_ready_plan_after_cancellation(
+    tmp_path: Path,
+):
+    provider = CompletingThenBlockingProvider("saved plan", "cancel retry complete")
+    session = build_session(tmp_path, provider)
+    await consume(await session.start("/plan prepare"))
+    ready = session.current_plan
+
+    execution = await session.start("/do")
+    await provider.entered.wait()
+    await execution.cancel()
+    events = await consume(execution)
+
+    assert events[-1].reason is StopReason.CANCELLED
+    assert session.current_plan == ready
+    retry = await consume(await session.start("/do"))
+    assert retry[-1].reason is StopReason.COMPLETED
     assert session.current_plan is not None
     assert session.current_plan.status is PlanStatus.COMPLETED
 

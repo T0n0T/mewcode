@@ -28,6 +28,7 @@ from mewcode.tools.base import (
     ConfirmationPreview,
     ToolCall,
     ToolExecutionPolicy,
+    ToolErrorInfo,
     ToolFeedback,
     ToolResult,
 )
@@ -183,6 +184,23 @@ class FailingScheduler:
         raise RuntimeError("internal sk-test-secret must stay hidden")
 
 
+class ToolFailureScheduler:
+    async def execute(self, calls, *, iteration, cancellation, events):
+        call = calls[0]
+        result = ToolResult(
+            status="error",
+            error=ToolErrorInfo(
+                "read_failed",
+                "file was not found",
+                retryable=True,
+            ),
+        )
+        return ToolScheduleOutcome(
+            (ToolFeedback(call.call_id, call.name, result),),
+            all_unknown=False,
+        )
+
+
 class BlockingToolScheduler:
     def __init__(self) -> None:
         self.cancelled = False
@@ -224,7 +242,7 @@ async def test_lifecycle_cancel_partial_text_reports_stable_identity():
     observed = [await anext(events) for _ in range(4)]
     await collector.started.wait()
     await run.cancel()
-    observed.append(await anext(events))
+    observed.extend([await anext(events) for _ in range(2)])
 
     assert run.run_id == "run-1"
     assert run.mode is RunMode.EXECUTE
@@ -233,14 +251,19 @@ async def test_lifecycle_cancel_partial_text_reports_stable_identity():
         ProgressChanged,
         ProgressChanged,
         TextDeltaEvent,
+        ProgressChanged,
         RunStopped,
     ]
     assert [
         event.phase for event in observed if isinstance(event, ProgressChanged)
-    ] == [RunPhase.WAITING_MODEL, RunPhase.STREAMING_MODEL]
+    ] == [
+        RunPhase.WAITING_MODEL,
+        RunPhase.STREAMING_MODEL,
+        RunPhase.STOPPING,
+    ]
     assert isinstance(observed[-1], RunStopped)
     assert observed[-1].reason is StopReason.CANCELLED
-    assert [event.context.sequence for event in observed] == [1, 2, 3, 4, 5]
+    assert [event.context.sequence for event in observed] == [1, 2, 3, 4, 5, 6]
     assert {event.context.run_id for event in observed} == {"run-1"}
     assert committed == []
 
@@ -320,6 +343,8 @@ async def test_natural_completion_commits_complete_assistant_once():
         (AssistantMessage("complete", provider_state),),
     ]
     assert collector.calls == 1
+    assert isinstance(observed[-2], ProgressChanged)
+    assert observed[-2].phase is RunPhase.STOPPING
     assert isinstance(observed[-1], RunStopped)
     assert observed[-1].reason is StopReason.COMPLETED
 
@@ -389,6 +414,7 @@ async def test_react_loop_commits_each_tool_feedback_as_an_iteration_transaction
         RunPhase.FEEDING_BACK,
         RunPhase.WAITING_MODEL,
         RunPhase.STREAMING_MODEL,
+        RunPhase.STOPPING,
     ]
     assert [type(event) for event in observed if isinstance(event, (ToolStarted, ToolFinished))] == [
         ToolStarted,
@@ -444,6 +470,7 @@ async def test_tool_feedback_confirmation_is_resolved_through_run_control():
         RunPhase.FEEDING_BACK,
         RunPhase.WAITING_MODEL,
         RunPhase.STREAMING_MODEL,
+        RunPhase.STOPPING,
     ]
     assert commits[-1] == (AssistantMessage("done", {"round": 2}),)
 
@@ -572,7 +599,7 @@ async def test_iteration_limit_commits_last_complete_batch_without_extra_request
                 {"round": index},
                 calls=(RawToolCall(0, f"call-{index}", "read_file", "{}"),),
             )
-            for index in range(1, 4)
+            for index in range(1, 12)
         ]
     )
     commits = []
@@ -583,14 +610,14 @@ async def test_iteration_limit_commits_last_complete_batch_without_extra_request
         collector,
         ScriptedScheduler(),
         lambda messages: commits.append(tuple(messages)),
-        max_iterations=2,
+        max_iterations=10,
         id_factory=lambda: "run-1",
     )
 
     observed = [event async for event in run]
 
-    assert len(collector.histories) == 2
-    assert len(commits) == 2
+    assert len(collector.histories) == 10
+    assert len(commits) == 10
     assert isinstance(observed[-1], RunStopped)
     assert observed[-1].reason is StopReason.ITERATION_LIMIT
 
@@ -633,7 +660,7 @@ async def test_provider_error_discards_current_iteration_and_keeps_prior_commit(
     collector = ScriptedCollector(
         [
             CollectedResponse("reading", {"round": 1}, calls=(first_call,)),
-            ProviderError("provider stream failed safely"),
+            ProviderError("provider stream failed with sk-test-secret"),
         ]
     )
     commits = []
@@ -654,7 +681,10 @@ async def test_provider_error_discards_current_iteration_and_keeps_prior_commit(
     assert len(commits[0]) == 2
     assert isinstance(observed[-1], RunStopped)
     assert observed[-1].reason is StopReason.PROVIDER_ERROR
-    assert observed[-1].message == "provider stream failed safely"
+    assert observed[-1].message == (
+        "The model provider stopped because of an error."
+    )
+    assert "sk-test-secret" not in repr(observed)
 
 
 @pytest.mark.asyncio
@@ -686,3 +716,37 @@ async def test_internal_error_is_safely_converted_without_partial_commit():
     assert isinstance(observed[-1], RunStopped)
     assert observed[-1].reason is StopReason.INTERNAL_ERROR
     assert "sk-test-secret" not in observed[-1].message
+
+
+@pytest.mark.asyncio
+async def test_tool_failure_feedback_allows_model_recovery():
+    collector = ScriptedCollector(
+        [
+            CollectedResponse(
+                "trying a read",
+                {},
+                calls=(RawToolCall(0, "call-1", "read_file", "{}"),),
+            ),
+            CollectedResponse("recovered answer", {}),
+        ]
+    )
+    commits = []
+    run = AgentRun(
+        AgentRequest(RunMode.EXECUTE, "task", "execute", "all"),
+        (UserMessage("task"),),
+        (),
+        collector,
+        ToolFailureScheduler(),
+        lambda messages: commits.append(tuple(messages)),
+        id_factory=lambda: "run-1",
+    )
+
+    observed = [event async for event in run]
+
+    feedback = commits[0][1]
+    assert isinstance(feedback, ToolResultsMessage)
+    assert feedback.results[0].result.error is not None
+    assert feedback.results[0].result.error.code == "read_failed"
+    assert collector.histories[1][-1] == feedback
+    assert isinstance(observed[-1], RunStopped)
+    assert observed[-1].reason is StopReason.COMPLETED

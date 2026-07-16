@@ -61,11 +61,6 @@ class AgentSession:
         self._unknown_tool_limit = unknown_tool_limit
         self._id_factory = id_factory or _new_id
         self._collector = ResponseCollector(provider)
-        self._scheduler = ToolScheduler(
-            registry,
-            executor,
-            id_factory=self._id_factory,
-        )
         self._history: list[ConversationMessage] = []
         self._current_plan: StoredPlan | None = None
         self._active_run: AgentRun | None = None
@@ -127,12 +122,18 @@ class AgentSession:
         *,
         invalid: tuple[str, str] | None = None,
     ) -> AgentRun:
+        scheduler = ToolScheduler(
+            self._registry,
+            self._executor,
+            id_factory=self._id_factory,
+            allowed_tool_names=(definition.name for definition in tools),
+        )
         return AgentRun(
             request,
             self._history,
             tools,
             self._collector,
-            self._scheduler,
+            scheduler,
             self._commit,
             max_iterations=self._max_iterations,
             unknown_tool_limit=self._unknown_tool_limit,

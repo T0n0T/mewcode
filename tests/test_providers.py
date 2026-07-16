@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError
 import httpx
 import pytest
 
+from mewcode.agent import AgentSession, RunStopped, StopReason, UsageReported
 from mewcode.cancellation import CancellationToken
 from mewcode.config import LLMConfig
 from mewcode.errors import ProviderError
@@ -20,7 +21,17 @@ from mewcode.providers.base import (
     TokenUsage,
 )
 from mewcode.providers.openai import OpenAIProvider
-from mewcode.tools.base import ToolDefinition, ToolFeedback, ToolResult
+from mewcode.tools.base import (
+    PreparedToolAction,
+    ToolAccess,
+    ToolDefinition,
+    ToolExecutionPolicy,
+    ToolFeedback,
+    ToolResult,
+)
+from mewcode.tools.executor import ToolExecutor
+from mewcode.tools.registry import ToolRegistry
+from mewcode.tools.workspace import Workspace
 
 
 class MockStream:
@@ -69,6 +80,42 @@ class MockHTTPClient:
 
     async def aclose(self):
         self.close_calls += 1
+
+
+class SequentialMockHTTPClient:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.calls = []
+        self.close_calls = 0
+
+    def stream(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        return MockStream(next(self.responses))
+
+    async def aclose(self):
+        self.close_calls += 1
+
+
+class EchoTool:
+    manages_own_timeout = False
+    access = ToolAccess.READ_ONLY
+    execution_policy = ToolExecutionPolicy.PARALLEL_SAFE
+    requires_confirmation = False
+
+    def __init__(self, name):
+        self.definition = ToolDefinition(
+            name,
+            name,
+            {"type": "object", "properties": {}, "additionalProperties": False},
+        )
+        self.executions = 0
+
+    async def prepare(self, arguments, context):
+        return PreparedToolAction({}, None)
+
+    async def execute(self, action, context):
+        self.executions += 1
+        return ToolResult(status="success", data={"name": self.definition.name})
 
 
 @pytest.fixture
@@ -423,7 +470,7 @@ async def test_anthropic_cancellation_and_client_ownership(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider_type", [OpenAIProvider, AnthropicProvider])
-async def test_dual_provider_stream_cancellation_closes_response(
+async def test_e2e_dual_provider_stream_cancellation_closes_response(
     provider_type, openai_config, anthropic_config
 ):
     token = CancellationToken()
@@ -441,3 +488,241 @@ async def test_dual_provider_stream_cancellation_closes_response(
     with pytest.raises(asyncio.CancelledError):
         await collect_events(provider_type(config, MockHTTPClient(response)), cancellation=token)
     assert response.close_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["openai", "anthropic"])
+async def test_e2e_dual_provider_multi_round_multi_tool_usage_and_history(
+    protocol,
+    openai_config,
+    anthropic_config,
+    tmp_path,
+):
+    if protocol == "openai":
+        first_state = [
+            {
+                "type": "function_call",
+                "call_id": "one",
+                "name": "first",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call",
+                "call_id": "two",
+                "name": "second",
+                "arguments": "{}",
+            },
+        ]
+        first_lines = [
+            *sse(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "one",
+                        "name": "first",
+                    },
+                }
+            ),
+            *sse(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "two",
+                        "name": "second",
+                    },
+                }
+            ),
+            *sse(
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": 0,
+                    "delta": "{}",
+                }
+            ),
+            *sse(
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": 1,
+                    "delta": "{}",
+                }
+            ),
+            *sse(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "output": first_state,
+                        "usage": {
+                            "input_tokens": 3,
+                            "output_tokens": 4,
+                            "total_tokens": 7,
+                        },
+                    },
+                }
+            ),
+        ]
+        second_lines = [
+            *sse({"type": "response.output_text.delta", "delta": "done"}),
+            *sse(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "output": [
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [],
+                            }
+                        ],
+                        "usage": {"input_tokens": 5},
+                    },
+                }
+            ),
+        ]
+        provider_type = OpenAIProvider
+        config = openai_config
+        expected_first_usage = TokenUsage(3, 4, 7)
+    else:
+        first_lines = [
+            *sse(
+                {
+                    "type": "message_start",
+                    "message": {"content": [], "usage": {"input_tokens": 3}},
+                },
+                "message_start",
+            ),
+            *sse(
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "one",
+                        "name": "first",
+                        "input": {},
+                    },
+                },
+                "content_block_start",
+            ),
+            *sse(
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": "{}",
+                    },
+                },
+                "content_block_delta",
+            ),
+            *sse(
+                {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "two",
+                        "name": "second",
+                        "input": {},
+                    },
+                },
+                "content_block_start",
+            ),
+            *sse(
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": "{}",
+                    },
+                },
+                "content_block_delta",
+            ),
+            *sse(
+                {
+                    "type": "message_delta",
+                    "delta": {},
+                    "usage": {"output_tokens": 4},
+                },
+                "message_delta",
+            ),
+            *sse({"type": "message_stop"}, "message_stop"),
+        ]
+        second_lines = [
+            *sse(
+                {
+                    "type": "message_start",
+                    "message": {"content": [], "usage": {"input_tokens": 5}},
+                },
+                "message_start",
+            ),
+            *sse(
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                "content_block_start",
+            ),
+            *sse(
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "done"},
+                },
+                "content_block_delta",
+            ),
+            *sse({"type": "message_stop"}, "message_stop"),
+        ]
+        provider_type = AnthropicProvider
+        config = anthropic_config
+        expected_first_usage = TokenUsage(3, 4, None)
+
+    client = SequentialMockHTTPClient(
+        [MockResponse(first_lines), MockResponse(second_lines)]
+    )
+    provider = provider_type(config, http_client=client)
+    registry = ToolRegistry()
+    tools = [EchoTool("first"), EchoTool("second")]
+    for tool in tools:
+        registry.register(tool)
+    session = AgentSession(
+        provider,
+        registry,
+        ToolExecutor(registry, Workspace(tmp_path), secrets=(config.api_key,)),
+    )
+
+    events = [event async for event in await session.start("use both tools")]
+    usage = [event for event in events if isinstance(event, UsageReported)]
+
+    assert isinstance(events[-1], RunStopped)
+    assert events[-1].reason is StopReason.COMPLETED
+    assert [tool.executions for tool in tools] == [1, 1]
+    assert [event.current for event in usage] == [
+        expected_first_usage,
+        TokenUsage(5, None, None),
+    ]
+    assert usage[-1].cumulative == TokenUsage(8, None, None)
+    assert len(client.calls) == 2
+    instruction_key = "instructions" if protocol == "openai" else "system"
+    assert client.calls[0][2]["json"][instruction_key] == (
+        client.calls[1][2]["json"][instruction_key]
+    )
+    replay_body = client.calls[1][2]["json"]
+    replay_json = json.dumps(replay_body)
+    assert "one" in replay_json and "two" in replay_json
+    assert config.api_key not in replay_json
+    tool_messages = [
+        message for message in session.history if isinstance(message, ToolResultsMessage)
+    ]
+    assert len(tool_messages) == 1
+    assert [feedback.call_id for feedback in tool_messages[0].results] == [
+        "one",
+        "two",
+    ]
+    assert isinstance(session.history[-1], AssistantMessage)
+    assert session.history[-1].content == "done"
