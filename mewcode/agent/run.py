@@ -45,6 +45,7 @@ from mewcode.tools.base import (
 
 HistoryCommit = Callable[[Sequence[ConversationMessage]], None]
 ToolPresenter = Callable[[str, Mapping[str, JSONValue]], ToolPresentation]
+RunClosedCallback = Callable[[str, RunMode, StopReason, str | None], None]
 
 
 def _new_id() -> str:
@@ -72,6 +73,8 @@ class AgentRun:
         id_factory: Callable[[], str] | None = None,
         tool_presenter: ToolPresenter | None = None,
         event_capacity: int = 64,
+        invalid: tuple[str, str] | None = None,
+        on_closed: RunClosedCallback | None = None,
     ) -> None:
         self._request = request
         self._history = list(history)
@@ -83,10 +86,14 @@ class AgentRun:
         self._unknown_tool_limit = unknown_tool_limit
         self._id_factory = id_factory or _new_id
         self._tool_presenter = tool_presenter or _hidden_presentation
+        self._invalid = invalid
+        self._on_closed = on_closed
         self._run_id = self._id_factory()
         self._current_iteration = 0
         self._cumulative_usage = TokenUsage(0, 0, 0)
         self._unknown_tool_streak = 0
+        self._stop_reason: StopReason | None = None
+        self._final_text: str | None = None
         self._cancellation = CancellationToken()
         self._confirmations = ConfirmationBroker(id_factory=self._id_factory)
         self._events = EventChannel(
@@ -193,6 +200,15 @@ class AgentRun:
                     self._request.source_plan_id,
                 )
             )
+            if self._invalid is not None:
+                code, message = self._invalid
+                await self._stop(
+                    StopReason.INVALID_REQUEST,
+                    message,
+                    None,
+                    code=code,
+                )
+                return
             for iteration in range(1, self._max_iterations + 1):
                 self._current_iteration = iteration
                 await self._progress(RunPhase.WAITING_MODEL, iteration)
@@ -223,6 +239,7 @@ class AgentRun:
                 assistant = AssistantMessage(response.text, response.provider_state)
                 if not response.calls:
                     self._commit_messages((assistant,))
+                    self._final_text = response.text
                     await self._stop(
                         StopReason.COMPLETED, "Run completed.", iteration
                     )
@@ -283,6 +300,13 @@ class AgentRun:
             )
         finally:
             self._confirmations.cancel_all()
+            if self._on_closed is not None and self._stop_reason is not None:
+                self._on_closed(
+                    self._run_id,
+                    self.mode,
+                    self._stop_reason,
+                    self._final_text,
+                )
 
     async def _progress(self, phase: RunPhase, iteration: int) -> bool:
         return await self._publish(
@@ -305,9 +329,12 @@ class AgentRun:
         *,
         code: str | None = None,
     ) -> bool:
-        return await self._events.stop(
+        stopped = await self._events.stop(
             RunStopped(self._context(iteration), reason, message, code)
         )
+        if stopped:
+            self._stop_reason = reason
+        return stopped
 
     def _context(self, iteration: int | None) -> EventContext:
         return EventContext(self._run_id, 0, iteration)

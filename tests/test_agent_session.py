@@ -1,7 +1,13 @@
+import ast
+import asyncio
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 
+import mewcode.agent as agent_api
+from mewcode.agent.events import RunStarted, RunStopped
+from mewcode.agent.session import AgentSession
 from mewcode.agent.types import (
     AgentRequest,
     PlanStatus,
@@ -10,6 +16,86 @@ from mewcode.agent.types import (
     StopReason,
     StoredPlan,
 )
+from mewcode.errors import MewCodeError, ProviderError
+from mewcode.messages import AssistantMessage, UserMessage
+from mewcode.providers.base import ProviderResponseCompleted, ProviderTextDelta
+from mewcode.tools.base import (
+    ToolAccess,
+    ToolDefinition,
+    ToolExecutionPolicy,
+)
+from mewcode.tools.executor import ToolExecutor
+from mewcode.tools.registry import ToolRegistry
+from mewcode.tools.workspace import Workspace
+
+
+class ScriptedProvider:
+    def __init__(self, scripts=()) -> None:
+        self.scripts = iter(scripts)
+        self.calls = []
+        self.close_calls = 0
+
+    async def stream_response(
+        self, history, tools, *, instructions, cancellation
+    ):
+        self.calls.append((tuple(history), tuple(tools), instructions, cancellation))
+        for event in next(self.scripts):
+            cancellation.raise_if_cancelled()
+            if isinstance(event, BaseException):
+                raise event
+            yield event
+
+    async def aclose(self):
+        self.close_calls += 1
+
+
+class BlockingProvider(ScriptedProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+
+    async def stream_response(
+        self, history, tools, *, instructions, cancellation
+    ):
+        self.calls.append((tuple(history), tuple(tools), instructions, cancellation))
+        self.entered.set()
+        await asyncio.Event().wait()
+        if False:
+            yield ProviderTextDelta("")
+
+
+class FakeTool:
+    manages_own_timeout = False
+    requires_confirmation = False
+
+    def __init__(self, name: str, access: ToolAccess) -> None:
+        self.definition = ToolDefinition(
+            name,
+            name,
+            {"type": "object", "properties": {}, "additionalProperties": False},
+        )
+        self.access = access
+        self.execution_policy = (
+            ToolExecutionPolicy.PARALLEL_SAFE
+            if access is ToolAccess.READ_ONLY
+            else ToolExecutionPolicy.SERIAL
+        )
+
+
+def build_session(tmp_path: Path, provider, **kwargs):
+    registry = ToolRegistry()
+    registry.register(FakeTool("read", ToolAccess.READ_ONLY))
+    registry.register(FakeTool("write", ToolAccess.MUTATING))
+    executor = ToolExecutor(registry, Workspace(tmp_path))
+    return AgentSession(provider, registry, executor, **kwargs)
+
+
+def completed(text: str):
+    return [ProviderTextDelta(text), ProviderResponseCompleted({"text": text})]
+
+
+async def consume(run):
+    return [event async for event in run]
 
 
 def test_agent_types_have_stable_values():
@@ -52,3 +138,240 @@ def test_stored_plan_is_an_immutable_snapshot():
     assert stored.status is PlanStatus.READY
     with pytest.raises(FrozenInstanceError):
         stored.content = "changed"
+
+
+@pytest.mark.asyncio
+async def test_command_parser_selects_execute_and_read_only_plan_modes(tmp_path: Path):
+    provider = ScriptedProvider([completed("answer"), completed("plan")])
+    session = build_session(tmp_path, provider)
+
+    execute = await session.start("hello")
+    await consume(execute)
+    plan = await session.start("/plan inspect the project")
+    await consume(plan)
+
+    assert execute.mode is RunMode.EXECUTE
+    assert plan.mode is RunMode.PLAN
+    assert [definition.name for definition in provider.calls[0][1]] == [
+        "read",
+        "write",
+    ]
+    assert [definition.name for definition in provider.calls[1][1]] == ["read"]
+    assert provider.calls[0][2] != provider.calls[1][2]
+    assert session.history == (
+        UserMessage("hello"),
+        AssistantMessage("answer", {"text": "answer"}),
+        UserMessage("inspect the project"),
+        AssistantMessage("plan", {"text": "plan"}),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user_input", "code"),
+    [
+        ("/plan", "empty_plan_task"),
+        ("/plan   ", "empty_plan_task"),
+        ("/do", "no_plan"),
+        ("/do extra", "do_takes_no_arguments"),
+    ],
+)
+async def test_command_parser_invalid_requests_do_not_call_provider_or_change_history(
+    tmp_path: Path, user_input: str, code: str
+):
+    provider = ScriptedProvider()
+    session = build_session(tmp_path, provider)
+
+    events = await consume(await session.start(user_input))
+
+    assert [type(event) for event in events] == [RunStarted, RunStopped]
+    assert events[-1].reason is StopReason.INVALID_REQUEST
+    assert events[-1].code == code
+    assert provider.calls == []
+    assert session.history == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_input", ["/PLAN task", "/DO", " /plan task"])
+async def test_command_parser_only_recognizes_exact_lowercase_prefix(
+    tmp_path: Path, user_input: str
+):
+    provider = ScriptedProvider([completed("answer")])
+    session = build_session(tmp_path, provider)
+
+    run = await session.start(user_input)
+    await consume(run)
+
+    assert run.mode is RunMode.EXECUTE
+    assert session.history[0] == UserMessage(user_input)
+
+
+@pytest.mark.asyncio
+async def test_single_run_rejects_overlap_then_preserves_history(tmp_path: Path):
+    provider = BlockingProvider()
+    session = build_session(tmp_path, provider)
+    first = await session.start("first")
+    await provider.entered.wait()
+
+    with pytest.raises(MewCodeError, match="already running"):
+        await session.start("second")
+
+    await first.cancel()
+    assert session.history == (UserMessage("first"),)
+
+
+@pytest.mark.asyncio
+async def test_plan_save_replaces_only_after_success_and_uses_read_only_tools(
+    tmp_path: Path,
+):
+    provider = ScriptedProvider(
+        [
+            completed("plan A"),
+            [ProviderError("planning failed")],
+            completed("plan B"),
+        ]
+    )
+    session = build_session(tmp_path, provider)
+
+    first = await session.start("/plan first task")
+    await consume(first)
+    plan_a = session.current_plan
+    failed = await session.start("/plan failed replacement")
+    failed_events = await consume(failed)
+
+    assert plan_a is not None
+    assert plan_a.content == "plan A"
+    assert plan_a.source_run_id == first.run_id
+    assert plan_a.status is PlanStatus.READY
+    assert failed_events[-1].reason is StopReason.PROVIDER_ERROR
+    assert session.current_plan == plan_a
+
+    replacement = await session.start("/plan replacement")
+    await consume(replacement)
+
+    assert session.current_plan is not None
+    assert session.current_plan.content == "plan B"
+    assert session.current_plan.source_run_id == replacement.run_id
+    assert session.current_plan != plan_a
+    assert all(
+        [definition.name for definition in call[1]] == ["read"]
+        for call in provider.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_do_lifecycle_executes_ready_plan_once_and_marks_it_completed(
+    tmp_path: Path,
+):
+    provider = ScriptedProvider([completed("saved plan"), completed("done")])
+    session = build_session(tmp_path, provider)
+    await consume(await session.start("/plan make a plan"))
+    ready = session.current_plan
+
+    execution = await session.start("/do")
+    await consume(execution)
+
+    assert ready is not None
+    assert execution.mode is RunMode.DO
+    assert provider.calls[1][0][-1] == UserMessage("saved plan")
+    assert [definition.name for definition in provider.calls[1][1]] == [
+        "read",
+        "write",
+    ]
+    assert session.current_plan is not None
+    assert session.current_plan.plan_id == ready.plan_id
+    assert session.current_plan.status is PlanStatus.COMPLETED
+
+    repeated = await consume(await session.start("/do"))
+    assert repeated[-1].reason is StopReason.INVALID_REQUEST
+    assert repeated[-1].code == "plan_completed"
+    assert len(provider.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_do_lifecycle_preserves_ready_plan_after_error_for_retry(tmp_path: Path):
+    provider = ScriptedProvider(
+        [
+            completed("saved plan"),
+            [ProviderError("execution failed")],
+            completed("retry done"),
+        ]
+    )
+    session = build_session(tmp_path, provider)
+    await consume(await session.start("/plan make a plan"))
+    ready = session.current_plan
+
+    failed = await consume(await session.start("/do"))
+    assert failed[-1].reason is StopReason.PROVIDER_ERROR
+    assert session.current_plan == ready
+
+    retried = await consume(await session.start("/do"))
+    assert retried[-1].reason is StopReason.COMPLETED
+    assert session.current_plan is not None
+    assert session.current_plan.status is PlanStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_close_is_idempotent_cancels_active_run_and_closes_provider_once(
+    tmp_path: Path,
+):
+    provider = BlockingProvider()
+    session = build_session(tmp_path, provider)
+    run = await session.start("task")
+    await provider.entered.wait()
+
+    await asyncio.gather(session.close(), session.close())
+    events = await consume(run)
+
+    assert events[-1].reason is StopReason.CANCELLED
+    assert provider.close_calls == 1
+    with pytest.raises(MewCodeError, match="closed"):
+        await session.start("later")
+
+
+def test_public_api_only_exports_session_run_plan_and_events():
+    expected = {
+        "AgentEvent",
+        "AgentRun",
+        "AgentSession",
+        "ConfirmationRequested",
+        "ConfirmationResolved",
+        "EventContext",
+        "PlanStatus",
+        "ProgressChanged",
+        "RunMode",
+        "RunPhase",
+        "RunStarted",
+        "RunStopped",
+        "StopReason",
+        "StoredPlan",
+        "TextDeltaEvent",
+        "ToolFinished",
+        "ToolStarted",
+        "UsageReported",
+    }
+
+    assert set(agent_api.__all__) == expected
+    assert all(hasattr(agent_api, name) for name in expected)
+    assert not hasattr(agent_api, "ResponseCollector")
+    assert not hasattr(agent_api, "ToolScheduler")
+    assert not hasattr(agent_api, "EventChannel")
+
+
+def test_import_direction_keeps_lower_layers_independent_from_agent_and_ui():
+    root = Path(__file__).parents[1]
+    sources = [root / "mewcode/messages.py", root / "mewcode/cancellation.py"]
+    sources.extend((root / "mewcode/providers").glob("*.py"))
+    sources.extend((root / "mewcode/tools").glob("*.py"))
+    forbidden = ("mewcode.agent", "mewcode.tui", "mewcode.cli")
+
+    imports = []
+    for source in sources:
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imports.append(node.module)
+
+    assert not [name for name in imports if name.startswith(forbidden)]
