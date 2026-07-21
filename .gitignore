@@ -1,0 +1,15 @@
+/mewcode
+config.yaml
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+.idea/
+.vscode/
+.mewcode/
+.claude/
+CLAUDE.md
+docs/
