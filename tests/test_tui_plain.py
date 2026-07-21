@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from mewcode.agent import AgentSession
+from mewcode.agent import AgentSession, EventContext, UsageReported
 from mewcode.config import LLMConfig
 from mewcode.errors import ProviderError
 from mewcode.messages import UserMessage
@@ -12,6 +12,7 @@ from mewcode.providers.base import (
     ProviderResponseCompleted,
     ProviderTextDelta,
     ProviderToolCallDelta,
+    TokenUsage,
 )
 from mewcode.tools.base import (
     ConfirmationPreview,
@@ -26,6 +27,7 @@ from mewcode.tools.executor import ToolExecutor
 from mewcode.tools.registry import ToolRegistry
 from mewcode.tools.workspace import Workspace
 from mewcode.tui.plain import PlainChatApp
+from mewcode.tui.presentation import usage_text
 
 
 class TrackingOutput(StringIO):
@@ -50,10 +52,8 @@ class ScriptedProvider:
         self.calls = []
         self.close_calls = 0
 
-    async def stream_response(
-        self, history, tools, *, instructions, cancellation
-    ):
-        self.calls.append((tuple(history), tuple(tools), instructions))
+    async def stream_response(self, request, *, cancellation):
+        self.calls.append(request)
         for event in next(self.scripts):
             cancellation.raise_if_cancelled()
             if isinstance(event, BaseException):
@@ -125,8 +125,14 @@ def config(protocol="openai"):
     )
 
 
-def completed(text: str):
-    return [ProviderTextDelta(text), ProviderResponseCompleted({"text": text})]
+def completed(text: str, usage: TokenUsage | None = None):
+    return [
+        ProviderTextDelta(text),
+        ProviderResponseCompleted(
+            {"text": text},
+            usage or TokenUsage(None, None, None),
+        ),
+    ]
 
 
 def tool_response(call_id: str, name: str, arguments: dict):
@@ -194,6 +200,50 @@ async def test_plain_events_progress_stop_reason_and_recovery(tmp_path: Path):
     assert "◆ Back" in text
     assert "assistant" not in text.lower()
     assert output.flush_count >= 3
+
+
+@pytest.mark.asyncio
+async def test_shared_usage_plain_displays_cache_and_omits_missing_fields(
+    tmp_path: Path,
+):
+    provider = ScriptedProvider(
+        [
+            completed("one", TokenUsage(10, 2, 12, 0, 8)),
+            completed("two", TokenUsage(4, 1, 5)),
+        ]
+    )
+    output = TrackingOutput()
+    app = PlainChatApp(
+        build_session(tmp_path, provider),
+        config(),
+        input_stream=StringIO("one\ntwo\nexit\n"),
+        output_stream=output,
+    )
+
+    assert await app.run() == 0
+
+    first = usage_text(
+        UsageReported(
+            EventContext("ignored", 0, 1),
+            TokenUsage(10, 2, 12, 0, 8),
+            TokenUsage(10, 2, 12, 0, 8),
+        )
+    )
+    second = usage_text(
+        UsageReported(
+            EventContext("ignored", 0, 1),
+            TokenUsage(4, 1, 5),
+            TokenUsage(4, 1, 5),
+        )
+    )
+    usage_lines = [
+        line for line in output.getvalue().splitlines() if "[tokens " in line
+    ]
+    assert usage_lines == [f"   [{first}]", f"   [{second}]"]
+    assert "cache-read:0" in usage_lines[0]
+    assert "cache-write:8" in usage_lines[0]
+    assert "cache-read" not in usage_lines[1]
+    assert "cache-write" not in usage_lines[1]
 
 
 @pytest.mark.asyncio
@@ -287,7 +337,7 @@ async def test_plain_invalid_command_and_history_recover_for_next_input(tmp_path
     assert await app.run() == 0
     assert "[INVALID REQUEST]" in output.getvalue()
     assert len(provider.calls) == 2
-    assert [message.content for message in provider.calls[1][0]] == [
+    assert [message.content for message in provider.calls[1].history] == [
         "one",
         "one",
         "two",
@@ -339,7 +389,7 @@ async def test_e2e_autonomous_task_reads_searches_edits_and_validates(
     assert target.read_text(encoding="utf-8") == "new\n"
     assert len(provider.calls) == 5
     assert [
-        provider.calls[index][0][-1].results[0].name
+        provider.calls[index].history[-1].results[0].name
         for index in range(1, 5)
     ] == ["read_file", "search_code", "edit_file", "run_command"]
     assert text.count("[CONFIRMATION APPROVED]") == 2
@@ -398,17 +448,34 @@ async def test_e2e_plan_do_reads_then_confirms_write_and_consumes_plan(
     assert target.read_text(encoding="utf-8") == "executed plan\n"
     assert len(provider.calls) == 4
     assert all(
-        [definition.name for definition in provider.calls[index][1]] == read_only
+        [definition.name for definition in provider.calls[index].prompt.tools]
+        == read_only
         for index in (0, 1)
     )
     assert all(
-        [definition.name for definition in provider.calls[index][1]] == all_tools
+        [definition.name for definition in provider.calls[index].prompt.tools]
+        == all_tools
         for index in (2, 3)
     )
-    assert provider.calls[0][2] == provider.calls[1][2]
-    assert provider.calls[2][2] == provider.calls[3][2]
-    assert provider.calls[0][2] != provider.calls[2][2]
-    assert provider.calls[2][0][-1].content == (
+    assert provider.calls[0].prompt.stable_instructions == (
+        provider.calls[3].prompt.stable_instructions
+    )
+    assert provider.calls[0].prompt.cache_identity == (
+        provider.calls[1].prompt.cache_identity
+    )
+    assert provider.calls[2].prompt.cache_identity == (
+        provider.calls[3].prompt.cache_identity
+    )
+    assert provider.calls[0].prompt.cache_identity != (
+        provider.calls[2].prompt.cache_identity
+    )
+    assert "read-only tools only" in (
+        provider.calls[0].prompt.system_supplement.lower()
+    )
+    assert "execute the saved plan" in (
+        provider.calls[2].prompt.system_supplement.lower()
+    )
+    assert provider.calls[2].history[-1].content == (
         "Replace old plan with executed plan."
     )
     assert session.current_plan is not None
@@ -450,7 +517,7 @@ async def test_e2e_stream_error_recovery_keeps_partial_text_without_calling_tool
     text = output.getvalue()
     assert tool.executions == 0
     assert len(provider.calls) == 2
-    assert [message.content for message in provider.calls[1][0]] == [
+    assert [message.content for message in provider.calls[1].history] == [
         "first",
         "second",
     ]
@@ -491,7 +558,7 @@ async def test_e2e_restart_drops_plan_and_keeps_plain_chat_and_quit(
     text = restarted_output.getvalue()
     assert restarted_session.current_plan is None
     assert len(restarted_provider.calls) == 1
-    assert restarted_provider.calls[0][0] == (UserMessage("hello"),)
+    assert restarted_provider.calls[0].history == (UserMessage("hello"),)
     assert "[INVALID REQUEST]" in text
     assert "fresh chat works" in text
     assert "[COMPLETED]" in text

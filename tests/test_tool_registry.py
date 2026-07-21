@@ -30,6 +30,57 @@ from mewcode.tools.registry import ToolRegistry
 from mewcode.tools.defaults import create_default_registry
 
 
+EXPECTED_BUILTIN_DESCRIPTIONS = {
+    "read_file": (
+        "Read a UTF-8 text file from the workspace, optionally by line range. "
+        "You must use this tool before edit_file, and before write_file when replacing "
+        "an existing file. Prefer it over run_command for reading file contents."
+    ),
+    "write_file": (
+        "Create a new UTF-8 text file or completely replace an existing one in the "
+        "workspace. Before replacing an existing file, first call read_file for the "
+        "same path in the current run. Prefer edit_file for localized changes, and do "
+        "not use run_command as a substitute."
+    ),
+    "edit_file": (
+        "Replace one exact, unique text occurrence in a workspace UTF-8 file. Before "
+        "calling this tool, first call read_file for the same path in the current run "
+        "and copy old_text exactly from the fresh result. Prefer it over write_file for "
+        "localized changes and over run_command for direct file edits."
+    ),
+    "run_command": (
+        "Run a complete shell command in the workspace after user confirmation. Use "
+        "this tool only when no dedicated MewCode tool fits the operation; do not use "
+        "shell commands as substitutes for read_file, glob_files, search_code, "
+        "write_file, or edit_file."
+    ),
+    "glob_files": (
+        "Find workspace files matching a relative glob pattern. Prefer this dedicated "
+        "tool over run_command for locating files by name or path pattern."
+    ),
+    "search_code": (
+        "Search UTF-8 text files in the workspace for a literal string or regular "
+        "expression, optionally restricted by a path pattern. Prefer this dedicated "
+        "tool over run_command for searching file contents."
+    ),
+}
+
+EXPECTED_BUILTIN_SCHEMA_SHAPES = {
+    "read_file": (
+        ("path", "start_line", "line_count"),
+        ("path",),
+    ),
+    "write_file": (("path", "content"), ("path", "content")),
+    "edit_file": (
+        ("path", "old_text", "new_text"),
+        ("path", "old_text", "new_text"),
+    ),
+    "run_command": (("command", "timeout_seconds"), ("command",)),
+    "glob_files": (("pattern",), ("pattern",)),
+    "search_code": (("query", "path_pattern", "regex"), ("query",)),
+}
+
+
 class FakeTool:
     requires_confirmation = False
 
@@ -237,3 +288,23 @@ def test_default_registry_builtin_policy_and_registration_order():
         assert descriptor.access is ToolAccess.MUTATING
         assert descriptor.execution_policy is ToolExecutionPolicy.SERIAL
         assert descriptor.requires_confirmation is True
+
+
+def test_default_registry_builtin_descriptions_and_schema_shapes_are_stable():
+    definitions = create_default_registry().definitions()
+
+    assert {
+        definition.name: definition.description for definition in definitions
+    } == EXPECTED_BUILTIN_DESCRIPTIONS
+    assert {
+        definition.name: (
+            tuple(definition.input_schema["properties"]),
+            tuple(definition.input_schema.get("required", ())),
+        )
+        for definition in definitions
+    } == EXPECTED_BUILTIN_SCHEMA_SHAPES
+    assert all(
+        definition.input_schema["type"] == "object"
+        and definition.input_schema["additionalProperties"] is False
+        for definition in definitions
+    )

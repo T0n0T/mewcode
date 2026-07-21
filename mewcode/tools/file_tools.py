@@ -48,7 +48,12 @@ class _FileState:
 class ReadFileTool:
     definition = ToolDefinition(
         name="read_file",
-        description="Read a UTF-8 text file from the workspace, optionally by line range.",
+        description=(
+            "Read a UTF-8 text file from the workspace, optionally by line range. "
+            "You must use this tool before edit_file, and before write_file when "
+            "replacing an existing file. Prefer it over run_command for reading "
+            "file contents."
+        ),
         input_schema=_object_schema(
             {
                 "path": {"type": "string", "minLength": 1},
@@ -108,7 +113,12 @@ class ReadFileTool:
 class WriteFileTool:
     definition = ToolDefinition(
         name="write_file",
-        description="Create or completely replace a UTF-8 text file in the workspace.",
+        description=(
+            "Create a new UTF-8 text file or completely replace an existing one in "
+            "the workspace. Before replacing an existing file, first call read_file "
+            "for the same path in the current run. Prefer edit_file for localized "
+            "changes, and do not use run_command as a substitute."
+        ),
         input_schema=_object_schema(
             {
                 "path": {"type": "string", "minLength": 1},
@@ -166,7 +176,13 @@ class WriteFileTool:
 class EditFileTool:
     definition = ToolDefinition(
         name="edit_file",
-        description="Replace one exact, unique text occurrence in a workspace UTF-8 file.",
+        description=(
+            "Replace one exact, unique text occurrence in a workspace UTF-8 file. "
+            "Before calling this tool, first call read_file for the same path in the "
+            "current run and copy old_text exactly from the fresh result. Prefer it "
+            "over write_file for localized changes and over run_command for direct "
+            "file edits."
+        ),
         input_schema=_object_schema(
             {
                 "path": {"type": "string", "minLength": 1},

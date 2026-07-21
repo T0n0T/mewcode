@@ -59,8 +59,8 @@ def test_agent_events_are_frozen_and_cover_the_public_contract():
     )
     usage = UsageReported(
         context,
-        TokenUsage(1, 2, 3),
-        TokenUsage(4, 5, 9),
+        TokenUsage(1, 2, 3, 0, 4),
+        TokenUsage(4, 5, 9, 7, None),
     )
     stopped = RunStopped(context, StopReason.COMPLETED, "Completed", "done")
 
@@ -81,6 +81,10 @@ def test_agent_events_are_frozen_and_cover_the_public_contract():
     assert confirmation.preview.details == "safe diff"
     assert resolved.approved is True
     assert usage.cumulative.total_tokens == 9
+    assert usage.current.cache_read_input_tokens == 0
+    assert usage.current.cache_write_input_tokens == 4
+    assert usage.cumulative.cache_read_input_tokens == 7
+    assert usage.cumulative.cache_write_input_tokens is None
     assert stopped.code == "done"
     with pytest.raises(FrozenInstanceError):
         context.sequence = 2

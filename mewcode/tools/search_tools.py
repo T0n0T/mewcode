@@ -43,7 +43,11 @@ def _validate_pattern(pattern: str) -> None:
 class GlobFilesTool:
     definition = ToolDefinition(
         name="glob_files",
-        description="Find workspace files matching a relative glob pattern.",
+        description=(
+            "Find workspace files matching a relative glob pattern. Prefer this "
+            "dedicated tool over run_command for locating files by name or path "
+            "pattern."
+        ),
         input_schema=_schema(
             {"pattern": {"type": "string", "minLength": 1}},
             ["pattern"],
@@ -84,7 +88,11 @@ class GlobFilesTool:
 class SearchCodeTool:
     definition = ToolDefinition(
         name="search_code",
-        description="Search text files in the workspace for a literal string or regular expression.",
+        description=(
+            "Search UTF-8 text files in the workspace for a literal string or regular "
+            "expression, optionally restricted by a path pattern. Prefer this dedicated "
+            "tool over run_command for searching file contents."
+        ),
         input_schema=_schema(
             {
                 "query": {"type": "string", "minLength": 1},

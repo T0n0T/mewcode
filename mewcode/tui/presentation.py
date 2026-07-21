@@ -85,13 +85,18 @@ def usage_text(event: UsageReported) -> str:
     def value(number: int | None) -> str:
         return "n/a" if number is None else str(number)
 
-    return (
-        "tokens "
-        f"in:{value(event.current.input_tokens)} "
-        f"out:{value(event.current.output_tokens)} "
-        f"total:{value(event.current.total_tokens)} "
-        "| cumulative "
-        f"in:{value(event.cumulative.input_tokens)} "
-        f"out:{value(event.cumulative.output_tokens)} "
-        f"total:{value(event.cumulative.total_tokens)}"
-    )
+    def fields(usage) -> list[str]:
+        parts = [
+            f"in:{value(usage.input_tokens)}",
+            f"out:{value(usage.output_tokens)}",
+            f"total:{value(usage.total_tokens)}",
+        ]
+        if usage.cache_read_input_tokens is not None:
+            parts.append(f"cache-read:{usage.cache_read_input_tokens}")
+        if usage.cache_write_input_tokens is not None:
+            parts.append(f"cache-write:{usage.cache_write_input_tokens}")
+        return parts
+
+    current = " ".join(fields(event.current))
+    cumulative = " ".join(fields(event.cumulative))
+    return f"tokens {current} | cumulative {cumulative}"

@@ -30,7 +30,12 @@ class _CommandState:
 class RunCommandTool:
     definition = ToolDefinition(
         name="run_command",
-        description="Run a complete shell command in the workspace after user confirmation.",
+        description=(
+            "Run a complete shell command in the workspace after user confirmation. "
+            "Use this tool only when no dedicated MewCode tool fits the operation; do "
+            "not use shell commands as substitutes for read_file, glob_files, "
+            "search_code, write_file, or edit_file."
+        ),
         input_schema={
             "type": "object",
             "properties": {

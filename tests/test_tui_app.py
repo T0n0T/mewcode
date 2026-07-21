@@ -6,7 +6,13 @@ import pytest
 from textual.geometry import Spacing
 from textual.widgets import Markdown, Static
 
-from mewcode.agent import AgentSession, RunStopped, StopReason
+from mewcode.agent import (
+    AgentSession,
+    EventContext,
+    RunStopped,
+    StopReason,
+    UsageReported,
+)
 from mewcode.config import LLMConfig
 from mewcode.errors import ProviderError
 from mewcode.messages import AssistantMessage, ToolResultsMessage, UserMessage
@@ -30,7 +36,7 @@ from mewcode.tools.workspace import Workspace
 from mewcode.tui.app import CyberpunkChatApp
 from mewcode.tui.metadata import SessionMetadata
 from mewcode.tui.plain import PlainChatApp
-from mewcode.tui.presentation import ActivityState
+from mewcode.tui.presentation import ActivityState, usage_text
 from mewcode.tui.widgets import (
     AssistantMessageView,
     ConfirmationModal,
@@ -51,10 +57,8 @@ class ScriptedProvider:
         self.calls = []
         self.close_calls = 0
 
-    async def stream_response(
-        self, history, tools, *, instructions, cancellation
-    ):
-        self.calls.append((tuple(history), tuple(tools), instructions))
+    async def stream_response(self, request, *, cancellation):
+        self.calls.append(request)
         for event in next(self.scripts):
             cancellation.raise_if_cancelled()
             if isinstance(event, BaseException):
@@ -73,11 +77,9 @@ class RecoveringProvider:
         self.cancelled = False
         self.close_calls = 0
 
-    async def stream_response(
-        self, history, tools, *, instructions, cancellation
-    ):
+    async def stream_response(self, request, *, cancellation):
         self.calls += 1
-        self.histories.append(tuple(history))
+        self.histories.append(request.history)
         if self.calls == 1:
             yield ProviderTextDelta("partial")
             self.first_text_sent.set()
@@ -380,7 +382,9 @@ async def test_rapid_chunks_are_batched_without_loss(
 
 
 @pytest.mark.asyncio
-async def test_tool_usage_confirmation_and_progress_share_run_events(tmp_path: Path):
+async def test_shared_usage_tool_confirmation_and_progress_share_run_events(
+    tmp_path: Path,
+):
     tool = ConfirmingTool()
     provider = ScriptedProvider(
         [
@@ -391,9 +395,9 @@ async def test_tool_usage_confirmation_and_progress_share_run_events(tmp_path: P
                     name_delta="write_test",
                     arguments_delta="{}",
                 ),
-                ProviderResponseCompleted({}, TokenUsage(1, 2, 3)),
+                ProviderResponseCompleted({}, TokenUsage(10, 2, 12, 0, 8)),
             ],
-            completed("done", usage=TokenUsage(4, 5, 9)),
+            completed("done", usage=TokenUsage(4, 1, 5)),
         ]
     )
     app = CyberpunkChatApp(
@@ -413,8 +417,22 @@ async def test_tool_usage_confirmation_and_progress_share_run_events(tmp_path: P
         assert "SUCCESS write_test" in str(card.title)
         assert tool.executed is True
         usage = [item.render().plain for item in app.query(".usage")]
-        assert any("total:3" in line for line in usage)
-        assert any("total:12" in line for line in usage)
+        assert usage == [
+            usage_text(
+                UsageReported(
+                    EventContext("ignored", 0, 1),
+                    TokenUsage(10, 2, 12, 0, 8),
+                    TokenUsage(10, 2, 12, 0, 8),
+                )
+            ),
+            usage_text(
+                UsageReported(
+                    EventContext("ignored", 0, 2),
+                    TokenUsage(4, 1, 5),
+                    TokenUsage(14, 3, 17),
+                )
+            ),
+        ]
         assert "hidden result" not in card._details.render().plain
 
 
@@ -503,7 +521,7 @@ async def test_e2e_mixed_batch_tui_keeps_out_of_order_cards_attached(
             )
             for name in "abcd"
         )
-        feedback = provider.calls[1][0][-1]
+        feedback = provider.calls[1].history[-1]
         assert isinstance(feedback, ToolResultsMessage)
         assert [item.name for item in feedback.results] == list("abcd")
 
@@ -598,7 +616,7 @@ async def test_e2e_cancel_recovery_from_parallel_tools_allows_follow_up(
         assert list(app.query(AssistantMessageView))[-1].query_one(
             Markdown
         ).source == "recovered"
-        assert provider.calls[1][0] == (
+        assert provider.calls[1].history == (
             UserMessage("first"),
             UserMessage("second"),
         )
@@ -647,7 +665,7 @@ async def test_e2e_cancel_recovery_from_confirmation_allows_follow_up(
         assert list(app.query(AssistantMessageView))[-1].query_one(
             Markdown
         ).source == "recovered"
-        assert provider.calls[1][0] == (
+        assert provider.calls[1].history == (
             UserMessage("first"),
             UserMessage("second"),
         )
@@ -698,7 +716,7 @@ async def test_e2e_cancel_recovery_from_active_command_allows_follow_up(
         assert list(app.query(AssistantMessageView))[-1].query_one(
             Markdown
         ).source == "recovered"
-        assert provider.calls[1][0] == (
+        assert provider.calls[1].history == (
             UserMessage("first"),
             UserMessage("second"),
         )
@@ -825,11 +843,13 @@ async def test_e2e_consumer_equivalence_preserves_requests_history_and_result(
     def provider_trace(provider):
         return [
             (
-                normalize_history(history),
-                tuple(definition.name for definition in definitions),
-                instructions,
+                normalize_history(request.history),
+                tuple(
+                    definition.name for definition in request.prompt.tools
+                ),
+                request.prompt.stable_instructions,
             )
-            for history, definitions, instructions in provider.calls
+            for request in provider.calls
         ]
 
     direct_root = tmp_path / "direct"
