@@ -1,4 +1,5 @@
 import asyncio
+from copy import deepcopy
 import inspect
 import json
 from dataclasses import FrozenInstanceError
@@ -11,15 +12,18 @@ from mewcode.cancellation import CancellationToken
 from mewcode.config import LLMConfig
 from mewcode.errors import ProviderError
 from mewcode.messages import AssistantMessage, ToolResultsMessage, UserMessage
+from mewcode.prompting import PromptPackage
 from mewcode.providers import create_provider
 from mewcode.providers.anthropic import AnthropicProvider
 from mewcode.providers.base import (
     LLMProvider,
+    ProviderRequest,
     ProviderResponseCompleted,
     ProviderTextDelta,
     ProviderToolCallDelta,
     TokenUsage,
 )
+from mewcode.providers.cache import is_unsupported_cache_hint
 from mewcode.providers.openai import OpenAIProvider
 from mewcode.tools.base import (
     PreparedToolAction,
@@ -55,6 +59,8 @@ class MockResponse:
 
     async def aiter_lines(self):
         for index, line in enumerate(self._lines):
+            if isinstance(line, BaseException):
+                raise line
             yield line
             if self.on_line is not None:
                 value = self.on_line(index)
@@ -94,6 +100,16 @@ class SequentialMockHTTPClient:
 
     async def aclose(self):
         self.close_calls += 1
+
+
+class RaisingHTTPClient:
+    def __init__(self, error):
+        self.error = error
+        self.calls = []
+
+    def stream(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        raise self.error
 
 
 class EchoTool:
@@ -184,13 +200,42 @@ def feedback(call_id="call-1", content="hello"):
     )
 
 
-async def collect_events(provider, history=(), tools=(), cancellation=None, instructions="mode"):
+def make_provider_request(
+    history=(),
+    tools=(),
+    *,
+    stable="mode",
+    supplement="<system-reminder>dynamic context</system-reminder>",
+    cache_identity="c" * 64,
+):
+    return ProviderRequest(
+        tuple(history),
+        PromptPackage(
+            stable,
+            supplement,
+            tuple(tools),
+            cache_identity,
+        ),
+    )
+
+
+async def collect_events(
+    provider,
+    history=(),
+    tools=(),
+    cancellation=None,
+    instructions="mode",
+    request=None,
+):
+    provider_request = request or make_provider_request(
+        history,
+        tools,
+        stable=instructions,
+    )
     return [
         event
         async for event in provider.stream_response(
-            history,
-            tools,
-            instructions=instructions,
+            provider_request,
             cancellation=cancellation or CancellationToken(),
         )
     ]
@@ -208,8 +253,83 @@ def test_base_types_token_usage_and_protocol_are_async():
     with pytest.raises(FrozenInstanceError):
         usage.input_tokens = 0
     signature = inspect.signature(LLMProvider.stream_response)
-    assert signature.parameters["instructions"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["request"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert signature.parameters["cancellation"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert "instructions" not in signature.parameters
     assert inspect.iscoroutinefunction(LLMProvider.aclose)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "body", "field_name", "expected"),
+    [
+        (
+            400,
+            {
+                "error": {
+                    "code": "unsupported_parameter",
+                    "param": "prompt_cache_key",
+                    "message": "Unsupported parameter: prompt_cache_key",
+                }
+            },
+            "prompt_cache_key",
+            True,
+        ),
+        (
+            422,
+            {
+                "errors": [
+                    {
+                        "loc": ["body", "cache_control"],
+                        "msg": "field is not supported",
+                    }
+                ]
+            },
+            "cache_control",
+            True,
+        ),
+        (
+            400,
+            {
+                "error": {
+                    "code": "invalid_value",
+                    "param": "prompt_cache_key",
+                    "message": "must be 64 characters",
+                }
+            },
+            "prompt_cache_key",
+            False,
+        ),
+        (
+            400,
+            {"error": {"message": "Unsupported parameter: another_field"}},
+            "prompt_cache_key",
+            False,
+        ),
+        (401, {"error": {"message": "prompt_cache_key unsupported"}}, "prompt_cache_key", False),
+        (403, {"error": {"message": "cache_control unsupported"}}, "cache_control", False),
+        (429, {"error": {"message": "cache_control unsupported"}}, "cache_control", False),
+        (500, {"error": {"message": "cache_control unsupported"}}, "cache_control", False),
+        (400, "prompt_cache_key is unsupported", "prompt_cache_key", False),
+        (400, None, "prompt_cache_key", False),
+    ],
+)
+def test_cache_hint_classifier_matrix(status_code, body, field_name, expected):
+    assert is_unsupported_cache_hint(status_code, body, field_name) is expected
+
+
+def test_cache_hint_classifier_does_not_expose_secret(capsys):
+    secret = "sk-classifier-secret"
+    body = {
+        "error": {
+            "message": f"invalid prompt_cache_key {secret}",
+            "param": "prompt_cache_key",
+        }
+    }
+
+    assert is_unsupported_cache_hint(400, body, "prompt_cache_key") is False
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert secret not in captured.err
 
 
 @pytest.mark.asyncio
@@ -228,7 +348,7 @@ async def test_factory_creates_both_providers_and_rejects_unknown(
 
 
 @pytest.mark.asyncio
-async def test_openai_request_instructions_text_delta_and_completed(
+async def test_openai_prompt_mapping_text_delta_and_completed(
     openai_config, tool_definition
 ):
     output = [{"type": "message", "role": "assistant", "content": []}]
@@ -261,8 +381,69 @@ async def test_openai_request_instructions_text_delta_and_completed(
     method, url, kwargs = client.calls[0]
     assert (method, url) == ("POST", "https://api.openai.test/v1/responses")
     assert kwargs["json"]["instructions"] == "execute safely"
-    assert kwargs["json"]["input"] == [{"role": "user", "content": "Hello"}]
+    assert kwargs["json"]["input"] == [
+        {
+            "role": "system",
+            "content": "<system-reminder>dynamic context</system-reminder>",
+        },
+        {"role": "user", "content": "Hello"},
+    ]
+    assert kwargs["json"]["prompt_cache_key"] == "c" * 64
     assert kwargs["json"]["tools"][0]["name"] == "read_file"
+
+
+@pytest.mark.asyncio
+async def test_openai_prompt_mapping_keeps_stable_prefix_across_dynamic_inputs(
+    openai_config,
+    tool_definition,
+):
+    second_tool = ToolDefinition(
+        "search_code",
+        "Search code",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    )
+    requests = [
+        make_provider_request(
+            [UserMessage("first")],
+            [tool_definition, second_tool],
+            stable="stable instructions",
+            supplement="<system-reminder>environment A</system-reminder>",
+            cache_identity="d" * 64,
+        ),
+        make_provider_request(
+            [UserMessage("second")],
+            [tool_definition, second_tool],
+            stable="stable instructions",
+            supplement="<system-reminder>environment B</system-reminder>",
+            cache_identity="d" * 64,
+        ),
+    ]
+    bodies = []
+    for request in requests:
+        client = MockHTTPClient(
+            MockResponse(
+                sse(
+                    {
+                        "type": "response.completed",
+                        "response": {"output": []},
+                    }
+                )
+            )
+        )
+        await collect_events(
+            OpenAIProvider(openai_config, client),
+            request=request,
+        )
+        bodies.append(client.calls[0][2]["json"])
+
+    assert bodies[0]["instructions"] == bodies[1]["instructions"]
+    assert bodies[0]["prompt_cache_key"] == bodies[1]["prompt_cache_key"]
+    assert bodies[0]["tools"] == bodies[1]["tools"]
+    assert [tool["name"] for tool in bodies[0]["tools"]] == [
+        "read_file",
+        "search_code",
+    ]
+    assert bodies[0]["input"] != bodies[1]["input"]
 
 
 @pytest.mark.asyncio
@@ -298,12 +479,34 @@ async def test_openai_history_multiple_feedback_and_tool_deltas(openai_config):
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ({"input_tokens": 1, "output_tokens": 2}, TokenUsage(1, 2, None)),
-        ({"input_tokens": True, "output_tokens": -1, "total_tokens": "3"}, TokenUsage(None, None, None)),
-        ({}, TokenUsage(None, None, None)),
+        (
+            {
+                "input_tokens": 1,
+                "output_tokens": 2,
+                "total_tokens": 3,
+                "input_tokens_details": {
+                    "cached_tokens": 4,
+                    "cache_write_tokens": 5,
+                },
+            },
+            TokenUsage(1, 2, 3, 4, 5),
+        ),
+        (
+            {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "input_tokens_details": {
+                    "cached_tokens": 0,
+                    "cache_write_tokens": 0,
+                },
+            },
+            TokenUsage(0, 0, 0, 0, 0),
+        ),
+        ({}, TokenUsage(None, None, None, None, None)),
     ],
 )
-async def test_openai_usage_validation(openai_config, raw, expected):
+async def test_openai_usage_missing_zero_and_positive(openai_config, raw, expected):
     client = MockHTTPClient(
         MockResponse(sse({"type": "response.completed", "response": {"output": [], "usage": raw}}))
     )
@@ -312,7 +515,214 @@ async def test_openai_usage_validation(openai_config, raw, expected):
 
 
 @pytest.mark.asyncio
-async def test_openai_completed_protocol_errors_and_redaction(openai_config):
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"input_tokens": True},
+        {"output_tokens": -1},
+        {"total_tokens": 1.5},
+        {"input_tokens": "1"},
+        {"input_tokens_details": {"cached_tokens": False}},
+        {"input_tokens_details": {"cache_write_tokens": -2}},
+        {"input_tokens_details": []},
+        None,
+    ],
+)
+async def test_openai_usage_invalid_values_stop_completion(openai_config, raw):
+    client = MockHTTPClient(
+        MockResponse(
+            sse(
+                {
+                    "type": "response.completed",
+                    "response": {"output": [], "usage": raw},
+                }
+            )
+        )
+    )
+    observed = []
+
+    with pytest.raises(ProviderError, match="usage"):
+        async for event in OpenAIProvider(
+            openai_config,
+            client,
+        ).stream_response(
+            make_provider_request(),
+            cancellation=CancellationToken(),
+        ):
+            observed.append(event)
+
+    assert not any(
+        isinstance(event, ProviderResponseCompleted) for event in observed
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 422])
+async def test_openai_cache_fallback_success(
+    openai_config,
+    tool_definition,
+    status_code,
+):
+    rejection = {
+        "error": {
+            "code": "unsupported_parameter",
+            "param": "prompt_cache_key",
+            "message": "Unsupported parameter: prompt_cache_key",
+        }
+    }
+    client = SequentialMockHTTPClient(
+        [
+            MockResponse(
+                status_code=status_code,
+                text=json.dumps(rejection),
+            ),
+            MockResponse(
+                sse(
+                    {
+                        "type": "response.completed",
+                        "response": {"output": []},
+                    }
+                )
+            ),
+        ]
+    )
+    request = make_provider_request(
+        [UserMessage("hello")],
+        [tool_definition],
+        stable="stable",
+        supplement="<system-reminder>dynamic</system-reminder>",
+        cache_identity="e" * 64,
+    )
+
+    events = await collect_events(
+        OpenAIProvider(openai_config, client),
+        request=request,
+    )
+
+    assert events == [
+        ProviderResponseCompleted([], TokenUsage(None, None, None))
+    ]
+    assert len(client.calls) == 2
+    first = client.calls[0][2]["json"]
+    second = client.calls[1][2]["json"]
+    expected_second = dict(first)
+    expected_second.pop("prompt_cache_key")
+    assert second == expected_second
+    assert request.prompt.cache_identity == "e" * 64
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "body"),
+    [
+        (401, {"error": {"message": "unauthorized"}}),
+        (429, {"error": {"message": "rate limited"}}),
+        (400, {"error": {"message": "unknown model"}}),
+        (
+            422,
+            {
+                "error": {
+                    "param": "prompt_cache_key",
+                    "message": "must be 64 characters",
+                }
+            },
+        ),
+    ],
+)
+async def test_openai_cache_no_retry_for_non_cache_errors(
+    openai_config,
+    status_code,
+    body,
+):
+    client = MockHTTPClient(
+        MockResponse(status_code=status_code, text=json.dumps(body))
+    )
+
+    with pytest.raises(ProviderError):
+        await collect_events(OpenAIProvider(openai_config, client))
+
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_cache_no_retry_for_plain_text_or_stream_error(openai_config):
+    plain_client = MockHTTPClient(
+        MockResponse(
+            status_code=400,
+            text="prompt_cache_key is unsupported",
+        )
+    )
+    with pytest.raises(ProviderError):
+        await collect_events(OpenAIProvider(openai_config, plain_client))
+    assert len(plain_client.calls) == 1
+
+    stream_client = SequentialMockHTTPClient(
+        [
+            MockResponse(
+                [
+                    *sse(
+                        {
+                            "type": "response.output_text.delta",
+                            "delta": "partial",
+                        }
+                    ),
+                    *sse(
+                        {
+                            "type": "error",
+                            "error": {
+                                "message": (
+                                    "prompt_cache_key is unsupported after streaming"
+                                )
+                            },
+                        },
+                        "error",
+                    ),
+                ]
+            ),
+            MockResponse(),
+        ]
+    )
+    with pytest.raises(ProviderError):
+        await collect_events(OpenAIProvider(openai_config, stream_client))
+    assert len(stream_client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_cache_no_retry_for_network_error(openai_config):
+    error = httpx.ConnectError("network unavailable")
+    client = RaisingHTTPClient(error)
+
+    with pytest.raises(ProviderError, match="network unavailable"):
+        await collect_events(OpenAIProvider(openai_config, client))
+
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_cache_no_retry_after_single_fallback(openai_config):
+    rejection = json.dumps(
+        {
+            "error": {
+                "param": "prompt_cache_key",
+                "message": "prompt_cache_key is unsupported",
+            }
+        }
+    )
+    client = SequentialMockHTTPClient(
+        [
+            MockResponse(status_code=400, text=rejection),
+            MockResponse(status_code=422, text=rejection),
+        ]
+    )
+
+    with pytest.raises(ProviderError):
+        await collect_events(OpenAIProvider(openai_config, client))
+
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_openai_cache_redaction_and_completed_protocol_errors(openai_config):
     for lines in (
         [*sse({"type": "response.output_text.delta", "delta": "partial"}), "data: [DONE]", ""],
         [*sse({"type": "response.completed", "response": {"output": []}}), *sse({"type": "response.completed", "response": {"output": []}})],
@@ -348,7 +758,7 @@ async def test_openai_cancellation_and_client_ownership(openai_config, no_proxy_
 
 
 @pytest.mark.asyncio
-async def test_anthropic_request_system_content_blocks_usage_and_completed(
+async def test_anthropic_prompt_mapping_system_blocks_usage_and_completed(
     anthropic_config, tool_definition
 ):
     lines = [
@@ -375,8 +785,379 @@ async def test_anthropic_request_system_content_blocks_usage_and_completed(
     ]
     assert events[-1].usage == TokenUsage(7, 3, None)
     body = client.calls[0][2]["json"]
-    assert body["system"] == "plan only"
+    assert body["system"] == [
+        {
+            "type": "text",
+            "text": "plan only",
+            "cache_control": {"type": "ephemeral"},
+        },
+        {
+            "type": "text",
+            "text": "<system-reminder>dynamic context</system-reminder>",
+        },
+    ]
+    assert body["tools"][0]["cache_control"] == {"type": "ephemeral"}
     assert body["thinking"] == {"type": "adaptive", "display": "omitted"}
+
+
+@pytest.mark.asyncio
+async def test_anthropic_prompt_mapping_marks_only_last_tool_and_not_history(
+    anthropic_config,
+    tool_definition,
+):
+    second_tool = ToolDefinition(
+        "search_code",
+        "Search code",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    )
+    response_lines = sse({"type": "message_stop"}, "message_stop")
+    bodies = []
+    for tools, supplement in (
+        ((), "<system-reminder>environment A</system-reminder>"),
+        (
+            (tool_definition,),
+            "<system-reminder>environment B</system-reminder>",
+        ),
+        (
+            (tool_definition, second_tool),
+            "<system-reminder>environment C</system-reminder>",
+        ),
+    ):
+        client = MockHTTPClient(MockResponse(response_lines))
+        request = make_provider_request(
+            [UserMessage("hello")],
+            tools,
+            stable="stable instructions",
+            supplement=supplement,
+            cache_identity="f" * 64,
+        )
+        await collect_events(
+            AnthropicProvider(anthropic_config, client),
+            request=request,
+        )
+        bodies.append(client.calls[0][2]["json"])
+
+    assert "tools" not in bodies[0]
+    assert bodies[0]["system"][0] == bodies[1]["system"][0]
+    assert bodies[1]["system"][0] == bodies[2]["system"][0]
+    assert bodies[0]["system"][1] != bodies[1]["system"][1]
+    assert bodies[1]["tools"][0]["cache_control"] == {
+        "type": "ephemeral"
+    }
+    assert "cache_control" not in bodies[2]["tools"][0]
+    assert bodies[2]["tools"][1]["cache_control"] == {
+        "type": "ephemeral"
+    }
+    assert [tool["name"] for tool in bodies[2]["tools"]] == [
+        "read_file",
+        "search_code",
+    ]
+    serialized_messages = json.dumps(bodies[2]["messages"])
+    assert "environment C" not in serialized_messages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("input_usage", "delta_usage", "expected"),
+    [
+        (
+            {
+                "input_tokens": 7,
+                "cache_read_input_tokens": 5,
+                "cache_creation_input_tokens": 2,
+            },
+            {"output_tokens": 3},
+            TokenUsage(7, 3, None, 5, 2),
+        ),
+        (
+            {
+                "input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            },
+            {"output_tokens": 0},
+            TokenUsage(0, 0, None, 0, 0),
+        ),
+        ({}, {}, TokenUsage(None, None, None, None, None)),
+    ],
+)
+async def test_anthropic_usage_missing_zero_positive_and_preserved(
+    anthropic_config,
+    input_usage,
+    delta_usage,
+    expected,
+):
+    lines = [
+        *sse(
+            {
+                "type": "message_start",
+                "message": {"content": [], "usage": input_usage},
+            },
+            "message_start",
+        ),
+        *sse(
+            {
+                "type": "message_start",
+                "message": {"content": []},
+            },
+            "message_start",
+        ),
+        *sse(
+            {
+                "type": "message_delta",
+                "delta": {},
+                "usage": delta_usage,
+            },
+            "message_delta",
+        ),
+        *sse(
+            {"type": "message_delta", "delta": {}},
+            "message_delta",
+        ),
+        *sse({"type": "message_stop"}, "message_stop"),
+    ]
+
+    events = await collect_events(
+        AnthropicProvider(
+            anthropic_config,
+            MockHTTPClient(MockResponse(lines)),
+        )
+    )
+
+    assert events[-1].usage == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "usage"),
+    [
+        ("message_start", {"input_tokens": True}),
+        ("message_start", {"cache_read_input_tokens": -1}),
+        ("message_start", {"cache_creation_input_tokens": 1.5}),
+        ("message_delta", {"output_tokens": "3"}),
+        ("message_delta", []),
+    ],
+)
+async def test_anthropic_usage_invalid_values_stop_completion(
+    anthropic_config,
+    event_type,
+    usage,
+):
+    if event_type == "message_start":
+        invalid = {
+            "type": "message_start",
+            "message": {"content": [], "usage": usage},
+        }
+    else:
+        invalid = {
+            "type": "message_delta",
+            "delta": {},
+            "usage": usage,
+        }
+    lines = [
+        *sse(
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            }
+        ),
+        *sse(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "partial"},
+            }
+        ),
+        *sse(invalid, event_type),
+        *sse({"type": "message_stop"}, "message_stop"),
+    ]
+    observed = []
+
+    with pytest.raises(ProviderError, match="usage"):
+        async for event in AnthropicProvider(
+            anthropic_config,
+            MockHTTPClient(MockResponse(lines)),
+        ).stream_response(
+            make_provider_request(),
+            cancellation=CancellationToken(),
+        ):
+            observed.append(event)
+
+    assert observed == [ProviderTextDelta("partial")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 422])
+async def test_anthropic_cache_fallback_success(
+    anthropic_config,
+    tool_definition,
+    status_code,
+):
+    rejection = {
+        "error": {
+            "code": "unsupported_field",
+            "field": "cache_control",
+            "message": "cache_control is not supported",
+        }
+    }
+    client = SequentialMockHTTPClient(
+        [
+            MockResponse(
+                status_code=status_code,
+                text=json.dumps(rejection),
+            ),
+            MockResponse(sse({"type": "message_stop"}, "message_stop")),
+        ]
+    )
+    original_schema = deepcopy(tool_definition.input_schema)
+    request = make_provider_request(
+        [UserMessage("hello")],
+        [tool_definition],
+        stable="stable",
+        supplement="<system-reminder>dynamic</system-reminder>",
+    )
+
+    events = await collect_events(
+        AnthropicProvider(anthropic_config, client),
+        request=request,
+    )
+
+    assert events == [
+        ProviderResponseCompleted([], TokenUsage(None, None, None))
+    ]
+    assert len(client.calls) == 2
+    first = client.calls[0][2]["json"]
+    second = client.calls[1][2]["json"]
+    expected_second = deepcopy(first)
+    for block in expected_second["system"]:
+        block.pop("cache_control", None)
+    for tool in expected_second["tools"]:
+        tool.pop("cache_control", None)
+    assert second == expected_second
+    assert all(
+        "cache_control" not in block for block in second["system"]
+    )
+    assert all("cache_control" not in tool for tool in second["tools"])
+    assert tool_definition.input_schema == original_schema
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "body"),
+    [
+        (401, {"error": {"message": "unauthorized"}}),
+        (429, {"error": {"message": "rate limited"}}),
+        (400, {"error": {"message": "unknown model"}}),
+        (
+            422,
+            {
+                "error": {
+                    "field": "cache_control",
+                    "message": "must be an object",
+                }
+            },
+        ),
+    ],
+)
+async def test_anthropic_cache_no_retry_for_non_cache_errors(
+    anthropic_config,
+    status_code,
+    body,
+):
+    client = MockHTTPClient(
+        MockResponse(status_code=status_code, text=json.dumps(body))
+    )
+
+    with pytest.raises(ProviderError):
+        await collect_events(AnthropicProvider(anthropic_config, client))
+
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_anthropic_cache_no_retry_for_plain_stream_or_network_errors(
+    anthropic_config,
+):
+    plain_client = MockHTTPClient(
+        MockResponse(status_code=400, text="cache_control is unsupported")
+    )
+    with pytest.raises(ProviderError):
+        await collect_events(AnthropicProvider(anthropic_config, plain_client))
+    assert len(plain_client.calls) == 1
+
+    stream_client = SequentialMockHTTPClient(
+        [
+            MockResponse(
+                [
+                    *sse(
+                        {
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {"type": "text", "text": ""},
+                        }
+                    ),
+                    *sse(
+                        {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": "text_delta",
+                                "text": "partial",
+                            },
+                        }
+                    ),
+                    *sse(
+                        {
+                            "type": "error",
+                            "error": {
+                                "message": "cache_control is unsupported"
+                            },
+                        },
+                        "error",
+                    ),
+                ]
+            ),
+            MockResponse(),
+        ]
+    )
+    with pytest.raises(ProviderError):
+        await collect_events(AnthropicProvider(anthropic_config, stream_client))
+    assert len(stream_client.calls) == 1
+
+    network_client = RaisingHTTPClient(
+        httpx.ConnectError("network unavailable")
+    )
+    with pytest.raises(ProviderError, match="network unavailable"):
+        await collect_events(
+            AnthropicProvider(anthropic_config, network_client)
+        )
+    assert len(network_client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_anthropic_cache_no_retry_after_single_fallback(
+    anthropic_config,
+):
+    rejection = json.dumps(
+        {
+            "error": {
+                "field": "cache_control",
+                "message": "cache_control is unsupported",
+            }
+        }
+    )
+    client = SequentialMockHTTPClient(
+        [
+            MockResponse(status_code=400, text=rejection),
+            MockResponse(status_code=422, text=rejection),
+        ]
+    )
+
+    with pytest.raises(ProviderError):
+        await collect_events(AnthropicProvider(anthropic_config, client))
+
+    assert len(client.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -416,7 +1197,9 @@ async def test_anthropic_thinking_multiple_tools_and_history(anthropic_config):
 
 
 @pytest.mark.asyncio
-async def test_anthropic_completed_errors_redaction_and_thinking_disabled(anthropic_config):
+async def test_anthropic_cache_redaction_completed_errors_and_thinking_disabled(
+    anthropic_config,
+):
     with pytest.raises(ProviderError, match="without a completed event"):
         await collect_events(
             AnthropicProvider(
@@ -491,8 +1274,146 @@ async def test_e2e_dual_provider_stream_cancellation_closes_response(
 
 
 @pytest.mark.asyncio
+async def test_provider_request_e2e_same_request_normalizes_both_providers(
+    openai_config,
+    anthropic_config,
+    tool_definition,
+):
+    request = make_provider_request(
+        [UserMessage("inspect")],
+        [tool_definition],
+        stable="stable instructions",
+        supplement="<system-reminder>dynamic context</system-reminder>",
+        cache_identity="9" * 64,
+    )
+    original_schema = deepcopy(tool_definition.input_schema)
+    openai_lines = [
+        *sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "read_file",
+                },
+            }
+        ),
+        *sse(
+            {
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": "{}",
+            }
+        ),
+        *sse({"type": "response.output_text.delta", "delta": "Hi"}),
+        *sse(
+            {
+                "type": "response.completed",
+                "response": {
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 7,
+                        "output_tokens": 3,
+                        "input_tokens_details": {
+                            "cached_tokens": 2,
+                            "cache_write_tokens": 1,
+                        },
+                    },
+                },
+            }
+        ),
+    ]
+    anthropic_lines = [
+        *sse(
+            {
+                "type": "message_start",
+                "message": {
+                    "content": [],
+                    "usage": {
+                        "input_tokens": 7,
+                        "cache_read_input_tokens": 2,
+                        "cache_creation_input_tokens": 1,
+                    },
+                },
+            },
+            "message_start",
+        ),
+        *sse(
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": "read_file",
+                    "input": {},
+                },
+            },
+            "content_block_start",
+        ),
+        *sse(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": "{}",
+                },
+            },
+            "content_block_delta",
+        ),
+        *sse(
+            {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "text", "text": ""},
+            },
+            "content_block_start",
+        ),
+        *sse(
+            {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "Hi"},
+            },
+            "content_block_delta",
+        ),
+        *sse(
+            {
+                "type": "message_delta",
+                "delta": {},
+                "usage": {"output_tokens": 3},
+            },
+            "message_delta",
+        ),
+        *sse({"type": "message_stop"}, "message_stop"),
+    ]
+
+    openai_events = await collect_events(
+        OpenAIProvider(
+            openai_config,
+            MockHTTPClient(MockResponse(openai_lines)),
+        ),
+        request=request,
+    )
+    anthropic_events = await collect_events(
+        AnthropicProvider(
+            anthropic_config,
+            MockHTTPClient(MockResponse(anthropic_lines)),
+        ),
+        request=request,
+    )
+
+    assert openai_events[:-1] == anthropic_events[:-1]
+    assert openai_events[-1].usage == TokenUsage(7, 3, None, 2, 1)
+    assert anthropic_events[-1].usage == openai_events[-1].usage
+    assert request.prompt.tools[0].input_schema == original_schema
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("protocol", ["openai", "anthropic"])
-async def test_e2e_dual_provider_multi_round_multi_tool_usage_and_history(
+async def test_provider_request_e2e_dual_provider_multi_round_multi_tool_usage_and_history(
     protocol,
     openai_config,
     anthropic_config,
@@ -708,10 +1629,14 @@ async def test_e2e_dual_provider_multi_round_multi_tool_usage_and_history(
     ]
     assert usage[-1].cumulative == TokenUsage(8, None, None)
     assert len(client.calls) == 2
-    instruction_key = "instructions" if protocol == "openai" else "system"
-    assert client.calls[0][2]["json"][instruction_key] == (
-        client.calls[1][2]["json"][instruction_key]
-    )
+    if protocol == "openai":
+        assert client.calls[0][2]["json"]["instructions"] == (
+            client.calls[1][2]["json"]["instructions"]
+        )
+    else:
+        assert client.calls[0][2]["json"]["system"][0] == (
+            client.calls[1][2]["json"]["system"][0]
+        )
     replay_body = client.calls[1][2]["json"]
     replay_json = json.dumps(replay_body)
     assert "one" in replay_json and "two" in replay_json

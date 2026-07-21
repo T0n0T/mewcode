@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
+from copy import deepcopy
 from typing import Any
 
 import httpx
@@ -17,11 +19,13 @@ from mewcode.messages import (
 )
 from mewcode.providers.base import (
     ProviderEvent,
+    ProviderRequest,
     ProviderResponseCompleted,
     ProviderTextDelta,
     ProviderToolCallDelta,
     TokenUsage,
 )
+from mewcode.providers.cache import is_unsupported_cache_hint
 from mewcode.providers.sse import iter_sse_events
 from mewcode.tools.base import ToolDefinition
 
@@ -38,22 +42,33 @@ class AnthropicProvider:
 
     async def stream_response(
         self,
-        history: Sequence[ConversationMessage],
-        tools: Sequence[ToolDefinition],
+        request: ProviderRequest,
         *,
-        instructions: str,
         cancellation: CancellationToken,
     ) -> AsyncIterator[ProviderEvent]:
         cancellation.raise_if_cancelled()
+        prompt = request.prompt
         body: dict[str, Any] = {
             "model": self.config.model,
-            "messages": _serialize_history(history),
-            "system": instructions,
+            "messages": _serialize_history(request.history),
+            "system": [
+                {
+                    "type": "text",
+                    "text": prompt.stable_instructions,
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "type": "text",
+                    "text": prompt.system_supplement,
+                },
+            ],
             "stream": True,
             "max_tokens": DEFAULT_MAX_TOKENS,
         }
-        if tools:
-            body["tools"] = [_serialize_tool(tool) for tool in tools]
+        if prompt.tools:
+            serialized_tools = [_serialize_tool(tool) for tool in prompt.tools]
+            serialized_tools[-1]["cache_control"] = {"type": "ephemeral"}
+            body["tools"] = serialized_tools
         if self.config.thinking:
             body["thinking"] = {"type": "adaptive", "display": "omitted"}
         headers = {
@@ -66,15 +81,18 @@ class AnthropicProvider:
         argument_parts: dict[int, list[str]] = {}
         input_tokens: int | None = None
         output_tokens: int | None = None
+        cache_read_input_tokens: int | None = None
+        cache_write_input_tokens: int | None = None
         completed = False
         url = f"{self.config.base_url}/messages"
 
         try:
-            async with self._http_client.stream(
-                "POST", url, headers=headers, json=body
+            async with self._stream_with_cache_fallback(
+                url,
+                headers,
+                body,
+                cancellation,
             ) as response:
-                cancellation.raise_if_cancelled()
-                await self._raise_for_status(response)
                 async for event in iter_sse_events(response):
                     cancellation.raise_if_cancelled()
                     data = event.data
@@ -89,14 +107,38 @@ class AnthropicProvider:
                         )
                     if event_type == "message_start":
                         message = data.get("message")
-                        usage = message.get("usage") if isinstance(message, dict) else None
-                        if isinstance(usage, dict):
-                            input_tokens = _non_negative_int(usage.get("input_tokens"))
+                        usage = _optional_usage(
+                            message,
+                            context="message_start",
+                        )
+                        if usage is not None:
+                            input_tokens = _merge_non_negative_int(
+                                input_tokens,
+                                usage,
+                                "input_tokens",
+                            )
+                            cache_read_input_tokens = _merge_non_negative_int(
+                                cache_read_input_tokens,
+                                usage,
+                                "cache_read_input_tokens",
+                            )
+                            cache_write_input_tokens = _merge_non_negative_int(
+                                cache_write_input_tokens,
+                                usage,
+                                "cache_creation_input_tokens",
+                            )
                         continue
                     if event_type == "message_delta":
-                        usage = data.get("usage")
-                        if isinstance(usage, dict):
-                            output_tokens = _non_negative_int(usage.get("output_tokens"))
+                        usage = _optional_usage(
+                            data,
+                            context="message_delta",
+                        )
+                        if usage is not None:
+                            output_tokens = _merge_non_negative_int(
+                                output_tokens,
+                                usage,
+                                "output_tokens",
+                            )
                         continue
                     if event_type == "content_block_start":
                         index = data.get("index")
@@ -152,7 +194,13 @@ class AnthropicProvider:
                         completed = True
                         yield ProviderResponseCompleted(
                             [blocks[index] for index in sorted(blocks)],
-                            TokenUsage(input_tokens, output_tokens, None),
+                            TokenUsage(
+                                input_tokens,
+                                output_tokens,
+                                None,
+                                cache_read_input_tokens,
+                                cache_write_input_tokens,
+                            ),
                         )
         except ProviderError as exc:
             cancellation.raise_if_cancelled()
@@ -182,16 +230,69 @@ class AnthropicProvider:
         status_code = getattr(response, "status_code", 200)
         if status_code < 400:
             return
-        raise ProviderError(
-            f"Anthropic API returned HTTP {status_code}: {await _response_text(response)}"
+        response_text = await _response_text(response)
+        raise _HTTPStatusError(
+            status_code,
+            _structured_error_body(response_text),
+            response_text,
         )
+
+    @asynccontextmanager
+    async def _stream_with_cache_fallback(
+        self,
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        cancellation: CancellationToken,
+    ):
+        fallback_used = False
+        request_body = body
+        while True:
+            async with self._http_client.stream(
+                "POST",
+                url,
+                headers=headers,
+                json=request_body,
+            ) as response:
+                cancellation.raise_if_cancelled()
+                try:
+                    await self._raise_for_status(response)
+                except _HTTPStatusError as exc:
+                    cancellation.raise_if_cancelled()
+                    if not fallback_used and is_unsupported_cache_hint(
+                        exc.status_code,
+                        exc.error_body,
+                        "cache_control",
+                    ):
+                        fallback_used = True
+                        request_body = _without_cache_control(body)
+                        continue
+                    raise ProviderError(
+                        f"Anthropic API returned HTTP {exc.status_code}: "
+                        f"{exc.response_text}"
+                    ) from exc
+                yield response
+                return
+
+
+class _HTTPStatusError(Exception):
+    def __init__(
+        self,
+        status_code: int,
+        error_body: object,
+        response_text: str,
+    ) -> None:
+        self.status_code = status_code
+        self.error_body = error_body
+        self.response_text = response_text
+        super().__init__(f"HTTP {status_code}")
 
 
 def _serialize_tool(tool: ToolDefinition) -> dict[str, Any]:
     return {
         "name": tool.name,
         "description": tool.description,
-        "input_schema": tool.input_schema,
+        "input_schema": deepcopy(tool.input_schema),
     }
 
 
@@ -238,8 +339,56 @@ def _append_message(
     messages[-1]["content"] = [*previous, *content]
 
 
-def _non_negative_int(value: Any) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+def _optional_usage(
+    container: object,
+    *,
+    context: str,
+) -> dict[str, Any] | None:
+    if not isinstance(container, dict) or "usage" not in container:
+        return None
+    usage = container["usage"]
+    if not isinstance(usage, dict):
+        raise ProviderError(
+            f"Anthropic {context} usage must be an object."
+        )
+    return usage
+
+
+def _merge_non_negative_int(
+    current: int | None,
+    values: dict[str, Any],
+    field_name: str,
+) -> int | None:
+    if field_name not in values:
+        return current
+    value = values[field_name]
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    raise ProviderError(
+        f"Anthropic usage field '{field_name}' must be a non-negative integer."
+    )
+
+
+def _without_cache_control(body: dict[str, Any]) -> dict[str, Any]:
+    fallback = deepcopy(body)
+    system = fallback.get("system")
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict):
+                block.pop("cache_control", None)
+    tools = fallback.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict):
+                tool.pop("cache_control", None)
+    return fallback
+
+
+def _structured_error_body(response_text: str) -> object:
+    try:
+        return json.loads(response_text)
+    except (json.JSONDecodeError, TypeError):
+        return None
 
 
 def _extract_error_message(data: dict[str, Any]) -> str:

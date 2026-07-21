@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Iterator, Sequence
+from copy import deepcopy
 from typing import Any
 
 import httpx
@@ -17,11 +18,13 @@ from mewcode.messages import (
 )
 from mewcode.providers.base import (
     ProviderEvent,
+    ProviderRequest,
     ProviderResponseCompleted,
     ProviderTextDelta,
     ProviderToolCallDelta,
     TokenUsage,
 )
+from mewcode.providers.cache import is_unsupported_cache_hint
 from mewcode.providers.sse import iter_sse_events
 from mewcode.tools.base import ToolDefinition
 
@@ -35,22 +38,25 @@ class OpenAIProvider:
 
     async def stream_response(
         self,
-        history: Sequence[ConversationMessage],
-        tools: Sequence[ToolDefinition],
+        request: ProviderRequest,
         *,
-        instructions: str,
         cancellation: CancellationToken,
     ) -> AsyncIterator[ProviderEvent]:
         cancellation.raise_if_cancelled()
         url = f"{self.config.base_url}/responses"
+        prompt = request.prompt
         body: dict[str, Any] = {
             "model": self.config.model,
-            "input": _serialize_history(history),
-            "instructions": instructions,
+            "input": [
+                {"role": "system", "content": prompt.system_supplement},
+                *_serialize_history(request.history),
+            ],
+            "instructions": prompt.stable_instructions,
+            "prompt_cache_key": prompt.cache_identity,
             "stream": True,
         }
-        if tools:
-            body["tools"] = [_serialize_tool(tool) for tool in tools]
+        if prompt.tools:
+            body["tools"] = [_serialize_tool(tool) for tool in prompt.tools]
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
@@ -58,27 +64,57 @@ class OpenAIProvider:
         }
 
         completed = False
+        fallback_used = False
+        request_body = body
         try:
-            async with self._http_client.stream(
-                "POST", url, headers=headers, json=body
-            ) as response:
-                cancellation.raise_if_cancelled()
-                await self._raise_for_status(response)
-                async for event in iter_sse_events(response):
-                    cancellation.raise_if_cancelled()
-                    for provider_event in _events_from_response(event.data, event.event):
+            while True:
+                try:
+                    async with self._http_client.stream(
+                        "POST",
+                        url,
+                        headers=headers,
+                        json=request_body,
+                    ) as response:
                         cancellation.raise_if_cancelled()
-                        if isinstance(provider_event, ProviderResponseCompleted):
-                            if completed:
-                                raise ProviderError(
-                                    "OpenAI response emitted more than one completed event."
-                                )
-                            completed = True
-                        elif completed:
-                            raise ProviderError(
-                                "OpenAI response emitted an event after completion."
-                            )
-                        yield provider_event
+                        await self._raise_for_status(response)
+                        async for event in iter_sse_events(response):
+                            cancellation.raise_if_cancelled()
+                            for provider_event in _events_from_response(
+                                event.data,
+                                event.event,
+                            ):
+                                cancellation.raise_if_cancelled()
+                                if isinstance(
+                                    provider_event,
+                                    ProviderResponseCompleted,
+                                ):
+                                    if completed:
+                                        raise ProviderError(
+                                            "OpenAI response emitted more than one "
+                                            "completed event."
+                                        )
+                                    completed = True
+                                elif completed:
+                                    raise ProviderError(
+                                        "OpenAI response emitted an event after completion."
+                                    )
+                                yield provider_event
+                    break
+                except _HTTPStatusError as exc:
+                    cancellation.raise_if_cancelled()
+                    if not fallback_used and is_unsupported_cache_hint(
+                        exc.status_code,
+                        exc.error_body,
+                        "prompt_cache_key",
+                    ):
+                        fallback_used = True
+                        request_body = dict(body)
+                        request_body.pop("prompt_cache_key", None)
+                        continue
+                    raise ProviderError(
+                        f"OpenAI API returned HTTP {exc.status_code}: "
+                        f"{exc.response_text}"
+                    ) from exc
         except ProviderError as exc:
             cancellation.raise_if_cancelled()
             raise ProviderError(
@@ -107,9 +143,25 @@ class OpenAIProvider:
         status_code = getattr(response, "status_code", 200)
         if status_code < 400:
             return
-        raise ProviderError(
-            f"OpenAI API returned HTTP {status_code}: {await _response_text(response)}"
+        response_text = await _response_text(response)
+        raise _HTTPStatusError(
+            status_code,
+            _structured_error_body(response_text),
+            response_text,
         )
+
+
+class _HTTPStatusError(Exception):
+    def __init__(
+        self,
+        status_code: int,
+        error_body: object,
+        response_text: str,
+    ) -> None:
+        self.status_code = status_code
+        self.error_body = error_body
+        self.response_text = response_text
+        super().__init__(f"HTTP {status_code}")
 
 
 def _serialize_tool(tool: ToolDefinition) -> dict[str, Any]:
@@ -117,7 +169,7 @@ def _serialize_tool(tool: ToolDefinition) -> dict[str, Any]:
         "type": "function",
         "name": tool.name,
         "description": tool.description,
-        "parameters": tool.input_schema,
+        "parameters": deepcopy(tool.input_schema),
     }
 
 
@@ -193,21 +245,55 @@ def _events_from_response(
             raise ProviderError(
                 "OpenAI completed response did not include an output list."
             )
-        usage = response.get("usage") if isinstance(response, dict) else None
+        usage = response.get("usage", {}) if isinstance(response, dict) else {}
         yield ProviderResponseCompleted(output, _normalize_usage(usage))
 
 
 def _normalize_usage(value: Any) -> TokenUsage:
-    usage = value if isinstance(value, dict) else {}
+    if isinstance(value, dict):
+        usage = value
+    else:
+        raise ProviderError("OpenAI response usage must be an object.")
+    details = _optional_usage_details(usage)
     return TokenUsage(
-        _non_negative_int(usage.get("input_tokens")),
-        _non_negative_int(usage.get("output_tokens")),
-        _non_negative_int(usage.get("total_tokens")),
+        _optional_non_negative_int(usage, "input_tokens"),
+        _optional_non_negative_int(usage, "output_tokens"),
+        _optional_non_negative_int(usage, "total_tokens"),
+        _optional_non_negative_int(details, "cached_tokens"),
+        _optional_non_negative_int(details, "cache_write_tokens"),
     )
 
 
-def _non_negative_int(value: Any) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+def _optional_usage_details(usage: dict[str, Any]) -> dict[str, Any]:
+    if "input_tokens_details" not in usage:
+        return {}
+    details = usage["input_tokens_details"]
+    if not isinstance(details, dict):
+        raise ProviderError(
+            "OpenAI response usage field 'input_tokens_details' must be an object."
+        )
+    return details
+
+
+def _optional_non_negative_int(
+    values: dict[str, Any],
+    field_name: str,
+) -> int | None:
+    if field_name not in values:
+        return None
+    value = values[field_name]
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    raise ProviderError(
+        f"OpenAI response usage field '{field_name}' must be a non-negative integer."
+    )
+
+
+def _structured_error_body(response_text: str) -> object:
+    try:
+        return json.loads(response_text)
+    except (json.JSONDecodeError, TypeError):
+        return None
 
 
 async def _response_text(response: Any) -> str:
