@@ -4,6 +4,7 @@ from mewcode.errors import ProviderError
 from mewcode.providers.base import (
     LLMProvider,
     ProviderEvent,
+    ProviderRequest,
     ProviderResponseCompleted,
     ProviderTextDelta,
     ProviderToolCallDelta,
@@ -30,6 +31,7 @@ def create_provider(config: LLMConfig) -> LLMProvider:
 __all__ = [
     "LLMProvider",
     "ProviderEvent",
+    "ProviderRequest",
     "ProviderResponseCompleted",
     "ProviderTextDelta",
     "ProviderToolCallDelta",

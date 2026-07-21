@@ -8,6 +8,7 @@ from typing import TextIO
 from mewcode.agent import AgentSession
 from mewcode.config import load_config
 from mewcode.errors import MewCodeError
+from mewcode.prompting import PromptBuilder, PromptOptions, capture_environment
 from mewcode.providers import create_provider
 from mewcode.tools import Workspace, create_default_registry
 from mewcode.tools.defaults import DEFAULT_OUTPUT_LIMITS
@@ -37,7 +38,16 @@ async def async_main(
         limits=DEFAULT_OUTPUT_LIMITS,
         secrets=(config.api_key,),
     )
-    session = AgentSession(provider, registry, executor)
+    prompt_builder = PromptBuilder()
+    prompt_options = PromptOptions()
+    session = AgentSession(
+        provider,
+        registry,
+        executor,
+        prompt_builder=prompt_builder,
+        environment_factory=lambda: capture_environment(workspace_path),
+        prompt_options=prompt_options,
+    )
     input_stream = stdin if stdin is not None else sys.stdin
     output_stream = stdout if stdout is not None else sys.stdout
 

@@ -1,6 +1,7 @@
 import ast
 import asyncio
 from dataclasses import FrozenInstanceError
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,11 @@ from mewcode.agent.types import (
 )
 from mewcode.errors import MewCodeError, ProviderError
 from mewcode.messages import AssistantMessage, ToolResultsMessage, UserMessage
+from mewcode.prompting import (
+    EnvironmentSnapshot,
+    PromptBuilder,
+    PromptOptions,
+)
 from mewcode.providers.base import (
     ProviderResponseCompleted,
     ProviderTextDelta,
@@ -41,10 +47,8 @@ class ScriptedProvider:
         self.calls = []
         self.close_calls = 0
 
-    async def stream_response(
-        self, history, tools, *, instructions, cancellation
-    ):
-        self.calls.append((tuple(history), tuple(tools), instructions, cancellation))
+    async def stream_response(self, request, *, cancellation):
+        self.calls.append((request, cancellation))
         for event in next(self.scripts):
             cancellation.raise_if_cancelled()
             if isinstance(event, BaseException):
@@ -60,10 +64,8 @@ class BlockingProvider(ScriptedProvider):
         super().__init__()
         self.entered = asyncio.Event()
 
-    async def stream_response(
-        self, history, tools, *, instructions, cancellation
-    ):
-        self.calls.append((tuple(history), tuple(tools), instructions, cancellation))
+    async def stream_response(self, request, *, cancellation):
+        self.calls.append((request, cancellation))
         self.entered.set()
         await asyncio.Event().wait()
         if False:
@@ -77,10 +79,8 @@ class CompletingThenBlockingProvider(ScriptedProvider):
         self.retry_text = retry_text
         self.entered = asyncio.Event()
 
-    async def stream_response(
-        self, history, tools, *, instructions, cancellation
-    ):
-        self.calls.append((tuple(history), tuple(tools), instructions, cancellation))
+    async def stream_response(self, request, *, cancellation):
+        self.calls.append((request, cancellation))
         if len(self.calls) == 1:
             yield ProviderTextDelta(self.first_text)
             yield ProviderResponseCompleted({"text": self.first_text})
@@ -102,10 +102,8 @@ class CancellableThenCompletingProvider(ScriptedProvider):
         self.entered = asyncio.Event()
         self.cancelled = asyncio.Event()
 
-    async def stream_response(
-        self, history, tools, *, instructions, cancellation
-    ):
-        self.calls.append((tuple(history), tuple(tools), instructions, cancellation))
+    async def stream_response(self, request, *, cancellation):
+        self.calls.append((request, cancellation))
         if len(self.calls) == 1:
             self.entered.set()
             try:
@@ -197,13 +195,14 @@ def test_agent_types_have_stable_values():
 
 
 def test_agent_request_distinguishes_all_modes_and_is_frozen():
-    execute = AgentRequest(RunMode.EXECUTE, "task", "execute", "all")
-    plan = AgentRequest(RunMode.PLAN, "task", "plan", "read_only")
-    do = AgentRequest(RunMode.DO, "saved plan", "do", "all", "plan-1")
+    execute = AgentRequest(RunMode.EXECUTE, "task", "all")
+    plan = AgentRequest(RunMode.PLAN, "task", "read_only")
+    do = AgentRequest(RunMode.DO, "saved plan", "all", "plan-1")
 
     assert (execute.mode, execute.tool_scope) == (RunMode.EXECUTE, "all")
     assert (plan.mode, plan.tool_scope) == (RunMode.PLAN, "read_only")
     assert (do.mode, do.source_plan_id) == (RunMode.DO, "plan-1")
+    assert not hasattr(execute, "instructions")
     with pytest.raises(FrozenInstanceError):
         execute.user_content = "changed"
 
@@ -228,12 +227,19 @@ async def test_command_parser_selects_execute_and_read_only_plan_modes(tmp_path:
 
     assert execute.mode is RunMode.EXECUTE
     assert plan.mode is RunMode.PLAN
-    assert [definition.name for definition in provider.calls[0][1]] == [
+    assert [
+        definition.name for definition in provider.calls[0][0].prompt.tools
+    ] == [
         "read",
         "write",
     ]
-    assert [definition.name for definition in provider.calls[1][1]] == ["read"]
-    assert provider.calls[0][2] != provider.calls[1][2]
+    assert [
+        definition.name for definition in provider.calls[1][0].prompt.tools
+    ] == ["read"]
+    assert (
+        provider.calls[0][0].prompt.system_supplement
+        != provider.calls[1][0].prompt.system_supplement
+    )
     assert session.history == (
         UserMessage("hello"),
         AssistantMessage("answer", {"text": "answer"}),
@@ -265,6 +271,170 @@ async def test_command_parser_invalid_requests_do_not_call_provider_or_change_hi
     assert events[-1].code == code
     assert provider.calls == []
     assert session.history == ()
+
+
+@pytest.mark.asyncio
+async def test_invalid_request_short_circuits_prompt_dependencies(
+    monkeypatch, tmp_path: Path
+):
+    provider = ScriptedProvider()
+
+    class UnusedPromptBuilder:
+        def prepare_run(self, **kwargs):
+            raise AssertionError("prompt builder must not run")
+
+    def unused_environment():
+        raise AssertionError("environment factory must not run")
+
+    session = build_session(
+        tmp_path,
+        provider,
+        prompt_builder=UnusedPromptBuilder(),
+        environment_factory=unused_environment,
+    )
+    monkeypatch.setattr(
+        session._registry,
+        "definitions",
+        lambda _scope: (_ for _ in ()).throw(
+            AssertionError("tool definitions must not be queried")
+        ),
+    )
+
+    events = await consume(await session.start("/plan"))
+
+    assert events[-1].reason is StopReason.INVALID_REQUEST
+    assert provider.calls == []
+    assert session.history == ()
+
+
+@pytest.mark.asyncio
+async def test_prompt_failure_does_not_commit_history_or_activate_run(tmp_path: Path):
+    provider = ScriptedProvider()
+    environment_calls = 0
+    environment = EnvironmentSnapshot(
+        tmp_path,
+        "TestOS",
+        "/bin/test-shell",
+        date(2026, 7, 21),
+        "UTC",
+    )
+
+    def capture_once():
+        nonlocal environment_calls
+        environment_calls += 1
+        return environment
+
+    session = build_session(
+        tmp_path,
+        provider,
+        environment_factory=capture_once,
+        prompt_options=PromptOptions(
+            custom_instructions="<system-reminder secret-marker>"
+        ),
+    )
+
+    with pytest.raises(ValueError) as error:
+        await session.start("task")
+
+    assert environment_calls == 1
+    assert "secret-marker" not in str(error.value)
+    assert session.history == ()
+    assert session._active_run is None
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_environment_factory_failure_precedes_history_and_provider(tmp_path: Path):
+    provider = ScriptedProvider()
+
+    def failed_environment():
+        raise RuntimeError("environment unavailable")
+
+    session = build_session(
+        tmp_path,
+        provider,
+        environment_factory=failed_environment,
+    )
+
+    with pytest.raises(RuntimeError, match="environment unavailable"):
+        await session.start("task")
+
+    assert session.history == ()
+    assert session._active_run is None
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_prompt_snapshot_captures_environment_mode_and_tool_scope_once(
+    tmp_path: Path,
+):
+    provider = ScriptedProvider(
+        [
+            completed("answer"),
+            completed("saved plan"),
+            completed("done"),
+        ]
+    )
+    environment = EnvironmentSnapshot(
+        tmp_path.resolve(),
+        "TestOS",
+        "/bin/test-shell",
+        date(2026, 7, 21),
+        "UTC",
+    )
+    environment_calls = 0
+
+    def environment_factory():
+        nonlocal environment_calls
+        environment_calls += 1
+        return environment
+
+    class RecordingPromptBuilder:
+        def __init__(self):
+            self.calls = []
+            self.delegate = PromptBuilder()
+
+        def prepare_run(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.delegate.prepare_run(**kwargs)
+
+    builder = RecordingPromptBuilder()
+    options = PromptOptions(custom_instructions="caller supplied")
+    session = build_session(
+        tmp_path,
+        provider,
+        prompt_builder=builder,
+        environment_factory=environment_factory,
+        prompt_options=options,
+    )
+
+    await consume(await session.start("hello"))
+    await consume(await session.start("/plan inspect"))
+    await consume(await session.start("/do"))
+
+    assert environment_calls == 3
+    assert [call["mode"] for call in builder.calls] == [
+        "execute",
+        "plan",
+        "do",
+    ]
+    assert all(call["environment"] is environment for call in builder.calls)
+    assert all(call["options"] is options for call in builder.calls)
+    assert [definition.name for definition in builder.calls[0]["tools"]] == [
+        "read",
+        "write",
+    ]
+    assert [definition.name for definition in builder.calls[1]["tools"]] == [
+        "read"
+    ]
+    assert [definition.name for definition in builder.calls[2]["tools"]] == [
+        "read",
+        "write",
+    ]
+    assert all(
+        request.prompt.system_supplement.count("caller supplied") == 1
+        for request, _cancellation in provider.calls
+    )
 
 
 @pytest.mark.asyncio
@@ -395,7 +565,7 @@ async def test_plan_replace_and_preserve_only_after_success_uses_read_only_tools
     assert session.current_plan.source_run_id == replacement.run_id
     assert session.current_plan != plan_a
     assert all(
-        [definition.name for definition in call[1]] == ["read"]
+        [definition.name for definition in call[0].prompt.tools] == ["read"]
         for call in provider.calls
     )
 
@@ -434,7 +604,7 @@ async def test_plan_read_only_treats_named_mutating_tool_as_unknown(
     assert events[-1].reason is StopReason.COMPLETED
     assert write.executions == 0
     assert all(
-        [definition.name for definition in call[1]] == ["read"]
+        [definition.name for definition in call[0].prompt.tools] == ["read"]
         for call in provider.calls
     )
     feedback = next(
@@ -517,8 +687,8 @@ async def test_do_lifecycle_executes_ready_plan_once_and_marks_it_completed(
 
     assert ready is not None
     assert execution.mode is RunMode.DO
-    assert provider.calls[1][0][-1] == UserMessage("saved plan")
-    assert [definition.name for definition in provider.calls[1][1]] == [
+    assert provider.calls[1][0].history[-1] == UserMessage("saved plan")
+    assert [definition.name for definition in provider.calls[1][0].prompt.tools] == [
         "read",
         "write",
     ]

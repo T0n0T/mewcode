@@ -1,4 +1,6 @@
 import asyncio
+from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -23,13 +25,15 @@ from mewcode.agent.scheduler import (
 from mewcode.agent.types import AgentRequest, RunMode, RunPhase, StopReason
 from mewcode.errors import ProviderError
 from mewcode.messages import AssistantMessage, ToolResultsMessage, UserMessage
-from mewcode.providers.base import TokenUsage
+from mewcode.prompting import EnvironmentSnapshot, PromptBuilder
+from mewcode.providers.base import ProviderRequest, TokenUsage
 from mewcode.tools.base import (
     ConfirmationPreview,
     ToolCall,
     ToolExecutionPolicy,
     ToolErrorInfo,
     ToolFeedback,
+    ToolDefinition,
     ToolResult,
 )
 
@@ -40,12 +44,10 @@ class BlockingCollector:
 
     async def collect(
         self,
-        history,
-        tools,
+        request,
         *,
         run_id,
         iteration,
-        instructions,
         cancellation,
         on_text,
         on_stream_started,
@@ -91,18 +93,17 @@ class CompletingCollector:
 class ScriptedCollector:
     def __init__(self, responses) -> None:
         self.responses = iter(responses)
-        self.histories = []
+        self.requests: list[ProviderRequest] = []
 
     async def collect(
         self,
-        history,
-        tools,
+        request,
         *,
         on_text,
         on_stream_started,
         **kwargs,
     ):
-        self.histories.append(tuple(history))
+        self.requests.append(request)
         response = next(self.responses)
         await on_stream_started()
         if isinstance(response, BaseException):
@@ -110,6 +111,24 @@ class ScriptedCollector:
         if response.text:
             await on_text(response.text)
         return response
+
+
+def _run_prompt(
+    *,
+    mode: str = "execute",
+    tools: tuple[ToolDefinition, ...] = (),
+):
+    return PromptBuilder().prepare_run(
+        mode=mode,
+        environment=EnvironmentSnapshot(
+            Path("/workspace"),
+            "TestOS",
+            "/bin/test-shell",
+            date(2026, 7, 21),
+            "UTC",
+        ),
+        tools=tools,
+    )
 
 
 class ScriptedScheduler:
@@ -229,9 +248,9 @@ async def test_lifecycle_cancel_partial_text_reports_stable_identity():
     collector = BlockingCollector()
     committed = []
     run = AgentRun(
-        AgentRequest(RunMode.EXECUTE, "task", "execute", "all"),
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
         (),
-        (),
+        _run_prompt(),
         collector,
         UnusedScheduler(),
         committed.extend,
@@ -273,9 +292,9 @@ async def test_cancel_model_before_first_fragment_stops_without_history_commit()
     collector = WaitingCollector()
     commits = []
     run = AgentRun(
-        AgentRequest(RunMode.EXECUTE, "task", "execute", "all"),
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
         (),
-        (),
+        _run_prompt(),
         collector,
         UnusedScheduler(),
         lambda messages: commits.append(tuple(messages)),
@@ -300,9 +319,9 @@ async def test_cancel_model_before_first_fragment_stops_without_history_commit()
 @pytest.mark.asyncio
 async def test_public_control_immediate_cancel_is_idempotent_and_closes_run():
     run = AgentRun(
-        AgentRequest(RunMode.EXECUTE, "task", "execute", "all"),
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
         (),
-        (),
+        _run_prompt(),
         IdleCollector(),
         UnusedScheduler(),
         lambda _messages: None,
@@ -327,9 +346,9 @@ async def test_natural_completion_commits_complete_assistant_once():
     collector = CompletingCollector(CollectedResponse("complete", provider_state))
     commit_calls = []
     run = AgentRun(
-        AgentRequest(RunMode.EXECUTE, "task", "execute", "all"),
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
         (),
-        (),
+        _run_prompt(),
         collector,
         UnusedScheduler(),
         lambda messages: commit_calls.append(tuple(messages)),
@@ -363,9 +382,9 @@ async def test_react_loop_commits_each_tool_feedback_as_an_iteration_transaction
     commits = []
     initial_history = (UserMessage("task"),)
     run = AgentRun(
-        AgentRequest(RunMode.EXECUTE, "task", "execute", "all"),
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
         initial_history,
-        (),
+        _run_prompt(),
         collector,
         scheduler,
         lambda messages: commits.append(tuple(messages)),
@@ -395,7 +414,7 @@ async def test_react_loop_commits_each_tool_feedback_as_an_iteration_transaction
         ),
         (AssistantMessage("final", {"round": 3}),),
     ]
-    assert collector.histories == [
+    assert [request.history for request in collector.requests] == [
         initial_history,
         initial_history + commits[0],
         initial_history + commits[0] + commits[1],
@@ -427,6 +446,102 @@ async def test_react_loop_commits_each_tool_feedback_as_an_iteration_transaction
 
 
 @pytest.mark.asyncio
+async def test_supplement_history_stays_transient_across_tool_feedback_rounds():
+    collector = ScriptedCollector(
+        [
+            CollectedResponse(
+                "reading",
+                {"round": 1},
+                calls=(RawToolCall(0, "call-1", "read_file", "{}"),),
+            ),
+            CollectedResponse("done", {"round": 2}),
+        ]
+    )
+    initial_history = (UserMessage("task"),)
+    run = AgentRun(
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
+        initial_history,
+        _run_prompt(),
+        collector,
+        ScriptedScheduler(),
+        lambda _messages: None,
+        id_factory=lambda: "run-1",
+    )
+
+    await run.wait_closed()
+
+    assert len(collector.requests) == 2
+    assert [type(message) for message in collector.requests[1].history] == [
+        UserMessage,
+        AssistantMessage,
+        ToolResultsMessage,
+    ]
+    for request in collector.requests:
+        supplement = request.prompt.system_supplement
+        assert all(supplement not in repr(message) for message in request.history)
+
+
+@pytest.mark.asyncio
+async def test_iteration_prompt_uses_full_on_first_and_sixth_and_resets_per_run():
+    responses = [
+        CollectedResponse(
+            f"round-{iteration}",
+            {"round": iteration},
+            calls=(
+                RawToolCall(0, f"call-{iteration}", "read_file", "{}"),
+            ),
+        )
+        for iteration in range(1, 6)
+    ]
+    responses.append(CollectedResponse("done", {"round": 6}))
+    collector = ScriptedCollector(responses)
+    run_prompt = _run_prompt()
+    run = AgentRun(
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
+        (UserMessage("task"),),
+        run_prompt,
+        collector,
+        ScriptedScheduler(),
+        lambda _messages: None,
+        id_factory=lambda: "run-1",
+    )
+
+    await run.wait_closed()
+
+    packages = [request.prompt for request in collector.requests]
+    assert len(packages) == 6
+    assert packages[0].system_supplement == packages[5].system_supplement
+    assert all(
+        package.system_supplement != packages[0].system_supplement
+        for package in packages[1:5]
+    )
+    assert {package.stable_instructions for package in packages} == {
+        run_prompt.stable_instructions
+    }
+    assert {package.cache_identity for package in packages} == {
+        run_prompt.cache_identity
+    }
+    assert all(package.tools is run_prompt.tools for package in packages)
+
+    reset_collector = ScriptedCollector([CollectedResponse("reset", {})])
+    reset = AgentRun(
+        AgentRequest(RunMode.EXECUTE, "next", "all"),
+        (UserMessage("next"),),
+        run_prompt,
+        reset_collector,
+        UnusedScheduler(),
+        lambda _messages: None,
+        id_factory=lambda: "run-2",
+    )
+    await reset.wait_closed()
+
+    assert (
+        reset_collector.requests[0].prompt.system_supplement
+        == packages[0].system_supplement
+    )
+
+
+@pytest.mark.asyncio
 async def test_tool_feedback_confirmation_is_resolved_through_run_control():
     collector = ScriptedCollector(
         [
@@ -441,9 +556,9 @@ async def test_tool_feedback_confirmation_is_resolved_through_run_control():
     ids = iter(["run-1", "confirm-1"])
     commits = []
     run = AgentRun(
-        AgentRequest(RunMode.EXECUTE, "task", "execute", "all"),
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
         (UserMessage("task"),),
-        (),
+        _run_prompt(),
         collector,
         ConfirmingScheduler(),
         lambda messages: commits.append(tuple(messages)),
@@ -489,9 +604,9 @@ async def test_cancel_confirmation_cleans_request_and_discards_transaction():
     ids = iter(["run-1", "confirm-1"])
     commits = []
     run = AgentRun(
-        AgentRequest(RunMode.EXECUTE, "task", "execute", "all"),
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
         (UserMessage("task"),),
-        (),
+        _run_prompt(),
         collector,
         ConfirmingScheduler(),
         lambda messages: commits.append(tuple(messages)),
@@ -525,9 +640,9 @@ async def test_cancel_tool_discards_current_iteration_transaction():
     scheduler = BlockingToolScheduler()
     commits = []
     run = AgentRun(
-        AgentRequest(RunMode.EXECUTE, "task", "execute", "all"),
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
         (UserMessage("task"),),
-        (),
+        _run_prompt(),
         collector,
         scheduler,
         lambda messages: commits.append(tuple(messages)),
@@ -553,22 +668,22 @@ async def test_usage_reports_each_round_and_preserves_unknown_cumulative_dimensi
             CollectedResponse(
                 "one",
                 {},
-                TokenUsage(1, 2, 3),
+                TokenUsage(1, 2, 3, 4, 0),
                 (RawToolCall(0, "call-1", "read_file", "{}"),),
             ),
             CollectedResponse(
                 "two",
                 {},
-                TokenUsage(4, None, 5),
+                TokenUsage(4, None, 5, None, 6),
                 (RawToolCall(0, "call-2", "read_file", "{}"),),
             ),
-            CollectedResponse("done", {}, TokenUsage(6, 7, None)),
+            CollectedResponse("done", {}, TokenUsage(6, 7, None, 8, 9)),
         ]
     )
     run = AgentRun(
-        AgentRequest(RunMode.EXECUTE, "task", "execute", "all"),
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
         (UserMessage("task"),),
-        (),
+        _run_prompt(),
         collector,
         ScriptedScheduler(),
         lambda _messages: None,
@@ -579,14 +694,14 @@ async def test_usage_reports_each_round_and_preserves_unknown_cumulative_dimensi
     usage = [event for event in observed if isinstance(event, UsageReported)]
 
     assert [event.current for event in usage] == [
-        TokenUsage(1, 2, 3),
-        TokenUsage(4, None, 5),
-        TokenUsage(6, 7, None),
+        TokenUsage(1, 2, 3, 4, 0),
+        TokenUsage(4, None, 5, None, 6),
+        TokenUsage(6, 7, None, 8, 9),
     ]
     assert [event.cumulative for event in usage] == [
-        TokenUsage(1, 2, 3),
-        TokenUsage(5, None, 8),
-        TokenUsage(11, None, None),
+        TokenUsage(1, 2, 3, 4, 0),
+        TokenUsage(5, None, 8, None, 6),
+        TokenUsage(11, None, None, None, 15),
     ]
 
 
@@ -604,9 +719,9 @@ async def test_iteration_limit_commits_last_complete_batch_without_extra_request
     )
     commits = []
     run = AgentRun(
-        AgentRequest(RunMode.EXECUTE, "task", "execute", "all"),
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
         (UserMessage("task"),),
-        (),
+        _run_prompt(),
         collector,
         ScriptedScheduler(),
         lambda messages: commits.append(tuple(messages)),
@@ -616,7 +731,7 @@ async def test_iteration_limit_commits_last_complete_batch_without_extra_request
 
     observed = [event async for event in run]
 
-    assert len(collector.histories) == 10
+    assert len(collector.requests) == 10
     assert len(commits) == 10
     assert isinstance(observed[-1], RunStopped)
     assert observed[-1].reason is StopReason.ITERATION_LIMIT
@@ -636,9 +751,9 @@ async def test_unknown_tool_limit_counts_rounds_resets_and_beats_iteration_limit
     )
     scheduler = FlaggedScheduler([True, False, True, True, True, True])
     run = AgentRun(
-        AgentRequest(RunMode.EXECUTE, "task", "execute", "all"),
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
         (UserMessage("task"),),
-        (),
+        _run_prompt(),
         collector,
         scheduler,
         lambda _messages: None,
@@ -649,7 +764,7 @@ async def test_unknown_tool_limit_counts_rounds_resets_and_beats_iteration_limit
 
     observed = [event async for event in run]
 
-    assert len(collector.histories) == 5
+    assert len(collector.requests) == 5
     assert isinstance(observed[-1], RunStopped)
     assert observed[-1].reason is StopReason.UNKNOWN_TOOL_LIMIT
 
@@ -665,9 +780,9 @@ async def test_provider_error_discards_current_iteration_and_keeps_prior_commit(
     )
     commits = []
     run = AgentRun(
-        AgentRequest(RunMode.EXECUTE, "task", "execute", "all"),
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
         (UserMessage("task"),),
-        (),
+        _run_prompt(),
         collector,
         ScriptedScheduler(),
         lambda messages: commits.append(tuple(messages)),
@@ -700,9 +815,9 @@ async def test_internal_error_is_safely_converted_without_partial_commit():
     )
     commits = []
     run = AgentRun(
-        AgentRequest(RunMode.EXECUTE, "task", "execute", "all"),
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
         (UserMessage("task"),),
-        (),
+        _run_prompt(),
         collector,
         FailingScheduler(),
         lambda messages: commits.append(tuple(messages)),
@@ -732,9 +847,9 @@ async def test_tool_failure_feedback_allows_model_recovery():
     )
     commits = []
     run = AgentRun(
-        AgentRequest(RunMode.EXECUTE, "task", "execute", "all"),
+        AgentRequest(RunMode.EXECUTE, "task", "all"),
         (UserMessage("task"),),
-        (),
+        _run_prompt(),
         collector,
         ToolFailureScheduler(),
         lambda messages: commits.append(tuple(messages)),
@@ -747,6 +862,6 @@ async def test_tool_failure_feedback_allows_model_recovery():
     assert isinstance(feedback, ToolResultsMessage)
     assert feedback.results[0].result.error is not None
     assert feedback.results[0].result.error.code == "read_failed"
-    assert collector.histories[1][-1] == feedback
+    assert collector.requests[1].history[-1] == feedback
     assert isinstance(observed[-1], RunStopped)
     assert observed[-1].reason is StopReason.COMPLETED

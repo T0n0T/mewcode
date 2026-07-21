@@ -33,12 +33,12 @@ from mewcode.messages import (
     ConversationMessage,
     ToolResultsMessage,
 )
-from mewcode.providers.base import TokenUsage
+from mewcode.prompting import RunPrompt
+from mewcode.providers.base import ProviderRequest, TokenUsage
 from mewcode.tools.base import (
     ConfirmationPreview,
     JSONValue,
     ToolCall,
-    ToolDefinition,
     ToolPresentation,
     ToolResult,
 )
@@ -87,7 +87,7 @@ class AgentRun:
         self,
         request: AgentRequest,
         history: Sequence[ConversationMessage],
-        tools: Sequence[ToolDefinition],
+        run_prompt: RunPrompt | None,
         collector: ResponseCollector,
         scheduler: ToolScheduler,
         commit: HistoryCommit,
@@ -100,9 +100,11 @@ class AgentRun:
         invalid: tuple[str, str] | None = None,
         on_closed: RunClosedCallback | None = None,
     ) -> None:
+        if run_prompt is None and invalid is None:
+            raise ValueError("A valid Agent run requires a prepared prompt.")
         self._request = request
         self._history = list(history)
-        self._tools = tuple(tools)
+        self._run_prompt = run_prompt
         self._collector = collector
         self._scheduler = scheduler
         self._commit = commit
@@ -114,7 +116,7 @@ class AgentRun:
         self._on_closed = on_closed
         self._run_id = self._id_factory()
         self._current_iteration = 0
-        self._cumulative_usage = TokenUsage(0, 0, 0)
+        self._cumulative_usage = TokenUsage(0, 0, 0, 0, 0)
         self._unknown_tool_streak = 0
         self._stop_reason: StopReason | None = None
         self._final_text: str | None = None
@@ -237,15 +239,17 @@ class AgentRun:
                 return
             if self._cancellation.is_cancelled:
                 raise asyncio.CancelledError
+            if self._run_prompt is None:
+                raise RuntimeError("A valid Agent run has no prepared prompt.")
             for iteration in range(1, self._max_iterations + 1):
                 self._current_iteration = iteration
                 await self._progress(RunPhase.WAITING_MODEL, iteration)
+                prompt = self._run_prompt.for_iteration(iteration)
+                provider_request = ProviderRequest(tuple(self._history), prompt)
                 response = await self._collector.collect(
-                    self._history,
-                    self._tools,
+                    provider_request,
                     run_id=self._run_id,
                     iteration=iteration,
-                    instructions=self._request.instructions,
                     cancellation=self._cancellation,
                     on_text=lambda text, current=iteration: self._publish(
                         TextDeltaEvent(self._context(current), text)
@@ -394,4 +398,12 @@ def _add_usage(cumulative: TokenUsage, current: TokenUsage) -> TokenUsage:
         add(cumulative.input_tokens, current.input_tokens),
         add(cumulative.output_tokens, current.output_tokens),
         add(cumulative.total_tokens, current.total_tokens),
+        add(
+            cumulative.cache_read_input_tokens,
+            current.cache_read_input_tokens,
+        ),
+        add(
+            cumulative.cache_write_input_tokens,
+            current.cache_write_input_tokens,
+        ),
     )

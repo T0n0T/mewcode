@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from mewcode.cancellation import CancellationToken
 from mewcode.errors import ProviderError
-from mewcode.messages import ConversationMessage
 from mewcode.providers.base import (
     LLMProvider,
+    ProviderRequest,
     ProviderResponseCompleted,
     ProviderTextDelta,
     ProviderToolCallDelta,
     TokenUsage,
 )
-from mewcode.tools.base import ToolDefinition
 
 TextSink = Callable[[str], Awaitable[None]]
 StreamStartedSink = Callable[[], Awaitable[None]]
@@ -41,12 +40,10 @@ class ResponseCollector:
 
     async def collect(
         self,
-        history: Sequence[ConversationMessage],
-        tools: Sequence[ToolDefinition],
+        request: ProviderRequest,
         *,
         run_id: str,
         iteration: int,
-        instructions: str,
         cancellation: CancellationToken,
         on_text: TextSink,
         on_stream_started: StreamStartedSink,
@@ -57,9 +54,7 @@ class ResponseCollector:
         stream_started = False
 
         async for event in self._provider.stream_response(
-            history,
-            tools,
-            instructions=instructions,
+            request,
             cancellation=cancellation,
         ):
             cancellation.raise_if_cancelled()

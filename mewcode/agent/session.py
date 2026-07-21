@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 from uuid import uuid4
 
 from mewcode.agent.collector import ResponseCollector
@@ -16,20 +17,18 @@ from mewcode.agent.types import (
 )
 from mewcode.errors import MewCodeError
 from mewcode.messages import ConversationMessage, UserMessage
+from mewcode.prompting import (
+    EnvironmentSnapshot,
+    PromptBuilder,
+    PromptOptions,
+    RunPrompt,
+    capture_environment,
+)
 from mewcode.providers.base import LLMProvider
-from mewcode.tools.base import ToolScope
 from mewcode.tools.executor import ToolExecutor
 from mewcode.tools.registry import ToolRegistry
 
-EXECUTE_INSTRUCTIONS = (
-    "Execute the user's request with the available tools and adapt to observations."
-)
-PLAN_INSTRUCTIONS = (
-    "Analyze the request with read-only tools and return a concrete implementation plan."
-)
-DO_INSTRUCTIONS = (
-    "Execute the saved plan with the available tools and adapt to observations."
-)
+EnvironmentFactory = Callable[[], EnvironmentSnapshot]
 
 
 @dataclass(frozen=True)
@@ -53,6 +52,9 @@ class AgentSession:
         max_iterations: int = 10,
         unknown_tool_limit: int = 3,
         id_factory: Callable[[], str] | None = None,
+        prompt_builder: PromptBuilder | None = None,
+        environment_factory: EnvironmentFactory | None = None,
+        prompt_options: PromptOptions | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -60,6 +62,11 @@ class AgentSession:
         self._max_iterations = max_iterations
         self._unknown_tool_limit = unknown_tool_limit
         self._id_factory = id_factory or _new_id
+        self._prompt_builder = prompt_builder or PromptBuilder()
+        self._environment_factory = environment_factory or (
+            lambda: capture_environment(Path.cwd())
+        )
+        self._prompt_options = prompt_options or PromptOptions()
         self._collector = ResponseCollector(provider)
         self._history: list[ConversationMessage] = []
         self._current_plan: StoredPlan | None = None
@@ -86,20 +93,26 @@ class AgentSession:
             request = AgentRequest(
                 parsed.mode,
                 "",
-                "",
                 "all",
                 self._current_plan.plan_id if self._current_plan is not None else None,
             )
             run = self._create_run(
                 request,
-                (),
+                None,
                 invalid=(parsed.code, parsed.message),
             )
         else:
             request = parsed
-            self._commit((UserMessage(request.user_content),))
             tools = self._registry.definitions(request.tool_scope)
-            run = self._create_run(request, tools)
+            environment = self._environment_factory()
+            run_prompt = self._prompt_builder.prepare_run(
+                mode=request.mode.value,
+                environment=environment,
+                tools=tools,
+                options=self._prompt_options,
+            )
+            self._commit((UserMessage(request.user_content),))
+            run = self._create_run(request, run_prompt)
         self._active_run = run
         return run
 
@@ -118,10 +131,11 @@ class AgentSession:
     def _create_run(
         self,
         request: AgentRequest,
-        tools: Sequence,
+        run_prompt: RunPrompt | None,
         *,
         invalid: tuple[str, str] | None = None,
     ) -> AgentRun:
+        tools = run_prompt.tools if run_prompt is not None else ()
         scheduler = ToolScheduler(
             self._registry,
             self._executor,
@@ -131,7 +145,7 @@ class AgentSession:
         return AgentRun(
             request,
             self._history,
-            tools,
+            run_prompt,
             self._collector,
             scheduler,
             self._commit,
@@ -157,7 +171,6 @@ class AgentSession:
             return AgentRequest(
                 RunMode.PLAN,
                 task,
-                PLAN_INSTRUCTIONS,
                 "read_only",
             )
 
@@ -183,7 +196,6 @@ class AgentSession:
             return AgentRequest(
                 RunMode.DO,
                 self._current_plan.content,
-                DO_INSTRUCTIONS,
                 "all",
                 self._current_plan.plan_id,
             )
@@ -191,7 +203,6 @@ class AgentSession:
         return AgentRequest(
             RunMode.EXECUTE,
             user_input,
-            EXECUTE_INSTRUCTIONS,
             "all",
         )
 

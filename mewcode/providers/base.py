@@ -1,17 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 from mewcode.cancellation import CancellationToken
-from mewcode.messages import (
-    AssistantMessage,
-    ConversationMessage,
-    ToolResultsMessage,
-    UserMessage,
-)
-from mewcode.tools.base import ToolCall, ToolDefinition, ToolFeedback
+from mewcode.messages import ConversationMessage
+from mewcode.prompting import PromptPackage
 
 ProviderProtocol = Literal["openai", "anthropic"]
 
@@ -21,6 +16,14 @@ class TokenUsage:
     input_tokens: int | None
     output_tokens: int | None
     total_tokens: int | None
+    cache_read_input_tokens: int | None = None
+    cache_write_input_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class ProviderRequest:
+    history: tuple[ConversationMessage, ...]
+    prompt: PromptPackage
 
 
 @dataclass(frozen=True)
@@ -48,10 +51,8 @@ ProviderEvent = ProviderTextDelta | ProviderToolCallDelta | ProviderResponseComp
 class LLMProvider(Protocol):
     def stream_response(
         self,
-        history: Sequence[ConversationMessage],
-        tools: Sequence[ToolDefinition],
+        request: ProviderRequest,
         *,
-        instructions: str,
         cancellation: CancellationToken,
     ) -> AsyncIterator[ProviderEvent]:
         """Yield unified provider events for the given conversation."""

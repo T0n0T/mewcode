@@ -40,7 +40,6 @@ class PlanStatus(str, Enum):
 class AgentRequest:
     mode: RunMode
     user_content: str
-    instructions: str
     tool_scope: ToolScope
     source_plan_id: str | None = None
 

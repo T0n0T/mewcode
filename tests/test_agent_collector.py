@@ -1,11 +1,14 @@
 import asyncio
+from dataclasses import FrozenInstanceError
 
 import pytest
 
 from mewcode.agent.collector import ResponseCollector
 from mewcode.cancellation import CancellationToken
 from mewcode.errors import ProviderError
+from mewcode.prompting import PromptPackage
 from mewcode.providers.base import (
+    ProviderRequest,
     ProviderResponseCompleted,
     ProviderTextDelta,
     ProviderToolCallDelta,
@@ -18,8 +21,8 @@ class FakeProvider:
         self.events = events
         self.calls = []
 
-    async def stream_response(self, history, tools, *, instructions, cancellation):
-        self.calls.append((history, tools, instructions, cancellation))
+    async def stream_response(self, request, *, cancellation):
+        self.calls.append((request, cancellation))
         for event in self.events:
             cancellation.raise_if_cancelled()
             if isinstance(event, BaseException):
@@ -31,16 +34,51 @@ class FakeProvider:
 
 
 async def collect(provider, on_text=None, on_stream_started=None):
+    request = ProviderRequest(
+        (),
+        PromptPackage(
+            "stable",
+            "<system-reminder>dynamic</system-reminder>",
+            (),
+            "a" * 64,
+        ),
+    )
     return await ResponseCollector(provider).collect(
-        (),
-        (),
+        request,
         run_id="run-1",
         iteration=2,
-        instructions="mode",
         cancellation=CancellationToken(),
         on_text=on_text or (lambda _text: asyncio.sleep(0)),
         on_stream_started=on_stream_started or (lambda: asyncio.sleep(0)),
     )
+
+
+@pytest.mark.asyncio
+async def test_provider_request_is_forwarded_unchanged_with_separate_cancellation():
+    provider = FakeProvider([ProviderResponseCompleted([])])
+    cancellation = CancellationToken()
+    request = ProviderRequest(
+        (),
+        PromptPackage(
+            "stable",
+            "<system-reminder>dynamic</system-reminder>",
+            (),
+            "b" * 64,
+        ),
+    )
+
+    await ResponseCollector(provider).collect(
+        request,
+        run_id="run-1",
+        iteration=1,
+        cancellation=cancellation,
+        on_text=lambda _text: asyncio.sleep(0),
+        on_stream_started=lambda: asyncio.sleep(0),
+    )
+
+    assert provider.calls == [(request, cancellation)]
+    with pytest.raises(FrozenInstanceError):
+        request.history = ()
 
 
 @pytest.mark.asyncio

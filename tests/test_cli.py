@@ -27,10 +27,8 @@ class FakeProvider:
         self.calls = []
         self.close_calls = 0
 
-    async def stream_response(
-        self, history, tools, *, instructions, cancellation
-    ):
-        self.calls.append((tuple(history), tuple(tools), instructions))
+    async def stream_response(self, request, *, cancellation):
+        self.calls.append(request)
         yield ProviderTextDelta("ok")
         yield ProviderResponseCompleted({"ok": True})
 
@@ -99,7 +97,8 @@ def test_cli_fixes_current_directory_as_workspace(monkeypatch, tmp_path: Path):
 
     assert code == 0
     assert observed["root"] == workspace
-    assert [definition.name for definition in provider.calls[0][1]] == [
+    request = provider.calls[0]
+    assert [definition.name for definition in request.prompt.tools] == [
         "read_file",
         "write_file",
         "edit_file",
@@ -107,6 +106,10 @@ def test_cli_fixes_current_directory_as_workspace(monkeypatch, tmp_path: Path):
         "glob_files",
         "search_code",
     ]
+    assert str(workspace) in request.prompt.system_supplement
+    assert "## Custom Instructions" not in request.prompt.system_supplement
+    assert "## Activated Skills" not in request.prompt.system_supplement
+    assert "## Long-term Memory" not in request.prompt.system_supplement
 
 
 @pytest.mark.asyncio
